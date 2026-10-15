@@ -3,7 +3,7 @@
 pkgname=multimusic
 # The same as `version` in Cargo.toml (a test checks). A fixed version, not a pkgver() function:
 # makepkg writes what pkgver() returns into this file, which then blocks `git pull`.
-pkgver=0.5.2
+pkgver=0.5.3
 pkgrel=1
 pkgdesc="Sumo: lightweight native music player for local files, Spotify and SoundCloud with synced lyrics, Discord Rich Presence and Last.fm scrobbling"
 arch=('x86_64' 'aarch64')

@@ -24,7 +24,7 @@ use crate::model::{
     Playlist, PlaylistKind, RepeatMode, Source, Track,
 };
 use crate::player::mpv::{Mpv, MpvEvent, MpvOptions, MpvSender};
-use crate::player::queue::Queue;
+use crate::player::queue::{Queue, QueueState};
 use crate::player::spotify::{self, SpotifyAuth, SpotifyDeck, SpotifyEngine, SpotifyEvent, SpotifySender};
 use crate::providers::apple_music::{self, AppleMusicApi};
 use crate::providers::soundcloud::{self, ScResolved, ScUser, SoundCloud};
@@ -51,8 +51,9 @@ pub enum Command {
     CycleRepeat,
     Enqueue(Vec<Track>),
     PlayNext(Vec<Track>),
-    JumpTo(usize),
-    RemoveUpcoming(usize),
+    /// Entry of the upcoming list and the song shown there (in case the queue moved on).
+    JumpTo(usize, String),
+    RemoveUpcoming(usize, String),
     ClearUpcoming,
     ToggleLike(Track),
     CreatePlaylist {
@@ -186,6 +187,8 @@ pub struct PlayerView {
     pub upcoming: Vec<Track>,
     pub up_next_len: usize,
     pub context: String,
+    /// First song of the list playback started from (tells lists with the same name apart).
+    pub context_first: Option<String>,
     /// Format of what's playing (codec, bit depth, sample rate).
     pub quality: Option<AudioQuality>,
 }
@@ -205,6 +208,7 @@ impl Default for PlayerView {
             upcoming: Vec::new(),
             up_next_len: 0,
             context: String::new(),
+            context_first: None,
             quality: None,
         }
     }
@@ -324,6 +328,8 @@ pub struct LyricsState {
     pub track_id: String,
     pub loading: bool,
     pub lyrics: Option<Lyrics>,
+    /// Lyrics are turned off in Settings (none were looked for).
+    pub off: bool,
 }
 
 /// Everything else the UI shows that isn't library or playback.
@@ -360,6 +366,8 @@ pub struct Feed {
     pub quit: bool,
     /// Settings were imported: the UI takes these over and the app restarts.
     pub imported_settings: Option<Box<Config>>,
+    /// Start Sumo again once it has closed (asked for after the player stopped working).
+    pub restart: bool,
     /// The settings file last exported.
     pub exported_settings: Option<PathBuf>,
     pub update: UpdateState,
@@ -541,8 +549,11 @@ struct SpotifySync {
     user: String,
     /// Playlists in Spotify's order with their track ids. `None` = unchanged since last sync.
     playlists: Vec<(SpotifyPlaylistMeta, Option<Vec<String>>)>,
-    /// Liked Songs track ids, newest first.
-    liked: Vec<String>,
+    /// Liked Songs track ids, newest first. `None` = couldn't be loaded (kept as they are).
+    liked: Option<Vec<String>>,
+    /// Playlists (Spotify ids) that couldn't be loaded this time: kept as they are rather
+    /// than taken for deleted.
+    kept: Vec<String>,
     /// Albums saved on Spotify that are new to the library.
     albums: Vec<Playlist>,
     /// New or updated track metadata.
@@ -552,7 +563,8 @@ struct SpotifySync {
 struct SoundCloudSync {
     user: String,
     likes: Vec<Track>,
-    playlists: Vec<ImportedPlaylist>,
+    /// Why the playlists couldn't be loaded, if they couldn't (they are kept as they are).
+    playlists: std::result::Result<Vec<ImportedPlaylist>, String>,
 }
 
 /// GitHub's API, where releases (updates) come from.
@@ -615,12 +627,34 @@ enum Engine {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SavedSession {
+    /// Before 0.5.3: the current song and what was coming up, as a plain list.
+    #[serde(default)]
     tracks: Vec<String>,
+    #[serde(default)]
     index: usize,
     position: f64,
+    #[serde(default)]
     context: String,
+    #[serde(default)]
     shuffle: bool,
+    #[serde(default)]
     repeat: RepeatMode,
+    /// The whole queue (play order, songs you queued, removed songs).
+    #[serde(default)]
+    queue: Option<QueueState>,
+    /// Songs of the queue the library doesn't have (from search, artist or album pages).
+    #[serde(default)]
+    extra: Vec<Track>,
+}
+
+/// Where in the current song playback was; saved every few seconds (the queue only when it
+/// changes).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedPosition {
+    track: String,
+    position: f64,
+    /// Already scrobbled: picking the song up again doesn't scrobble it twice.
+    scrobbled: bool,
 }
 
 pub struct Service {
@@ -645,6 +679,14 @@ pub struct Service {
     started_reported: bool,
     resume_position: Option<f64>,
     consecutive_failures: u32,
+    /// Pause was pressed while the song was loading: it starts paused.
+    pause_wanted: bool,
+    /// The queue changed and the saved session is behind.
+    session_dirty: bool,
+    /// When the playback position was last saved.
+    position_saved_at: Instant,
+    /// The song picked up from the last run, if it had been scrobbled then.
+    resumed_scrobbled: Option<String>,
 
     mpv: Option<Mpv>,
     /// An idle mpv kept for the next crossfade.
@@ -652,6 +694,10 @@ pub struct Service {
     mpv_next_id: u64,
     mpv_tx: MpvSender,
     mpv_preloaded: Option<String>,
+    /// mpv's playlist entry for the current song; `None` until the file we asked for starts.
+    /// The end of any other entry (one that finished just as another song was asked for) is
+    /// ignored.
+    mpv_entry: Option<i64>,
     /// The previous track fading out on its own player during a crossfade.
     fading: Option<Fading>,
     /// The current track's fade-in during a crossfade.
@@ -669,6 +715,10 @@ pub struct Service {
     spotify_api: Arc<SpotifyApi>,
     /// A Spotify page waiting for the session to connect.
     spotify_pending_page: Option<String>,
+    /// A Spotify song waiting for the connection (load number, song, start position).
+    spotify_pending_play: Option<(u64, Track, f64)>,
+    /// The load that was a retry after a stream broke off (only one retry per song).
+    retried_load: u64,
     /// Recently loaded pages, so going back doesn't reload them.
     page_cache: Vec<PageState>,
     /// Apple Music developer token (from the settings, or scraped once).
@@ -786,12 +836,17 @@ impl Service {
             load_seq: 0,
             started_reported: false,
             resume_position: None,
+            pause_wanted: false,
+            session_dirty: false,
+            position_saved_at: Instant::now(),
+            resumed_scrobbled: None,
             consecutive_failures: 0,
             mpv: None,
             mpv_spare: None,
             mpv_next_id: 1,
             mpv_tx,
             mpv_preloaded: None,
+            mpv_entry: None,
             fading: None,
             fade_in: None,
             spotify_auth,
@@ -803,6 +858,8 @@ impl Service {
             spotify_tx,
             spotify_api: Arc::new(SpotifyApi::new(http)),
             spotify_pending_page: None,
+            spotify_pending_play: None,
+            retried_load: 0,
             page_cache: Vec::new(),
             apple_dev_token: Arc::new(tokio::sync::Mutex::new(None)),
             soundcloud,
@@ -939,7 +996,8 @@ impl Service {
                 self.publish_queue();
             }
             Command::TogglePause => {
-                if self.status == PlayStatus::Playing {
+                let loading = self.status == PlayStatus::Loading;
+                if self.status == PlayStatus::Playing || (loading && !self.pause_wanted) {
                     self.pause().await;
                 } else {
                     self.resume().await;
@@ -1006,22 +1064,28 @@ impl Service {
                 self.after_queue_change().await;
             }
             Command::PlayNext(tracks) => {
+                let n = tracks.len();
                 if self.queue.is_empty() {
                     self.queue.set_context(tracks, 0, "Queue".into());
                     self.play_current(0.0).await;
                 } else {
                     self.queue.play_next(tracks);
+                    self.shared.info(if n == 1 {
+                        "Plays next".to_string()
+                    } else {
+                        format!("{n} tracks play next")
+                    });
                 }
                 self.after_queue_change().await;
             }
-            Command::JumpTo(i) => {
-                if self.queue.jump_to(i).is_some() {
+            Command::JumpTo(i, id) => {
+                if self.queue.jump_to(i, &id).is_some() {
                     self.play_current(0.0).await;
                 }
                 self.publish_queue();
             }
-            Command::RemoveUpcoming(i) => {
-                self.queue.remove(i);
+            Command::RemoveUpcoming(i, id) => {
+                self.queue.remove(i, &id);
                 self.after_queue_change().await;
             }
             Command::ClearUpcoming => {
@@ -1272,6 +1336,9 @@ impl Service {
         };
         self.load_seq += 1;
         self.started_reported = false;
+        self.pause_wanted = false;
+        // `start` is where this song starts; a position saved for another one doesn't apply.
+        self.resume_position = None;
         self.playing = None;
         self.duration = track.duration_secs();
         self.set_position(start);
@@ -1295,6 +1362,7 @@ impl Service {
                 self.start_mpv(track, &path, start).await;
             }
             Source::SoundCloud => {
+                self.silence_engine().await;
                 let sc = self.soundcloud.clone();
                 let tx = self.internal_tx.clone();
                 tokio::spawn(async move {
@@ -1325,6 +1393,7 @@ impl Service {
                     Box::pin(self.dispatch_resolved(track, local, start)).await;
                     return;
                 }
+                self.silence_engine().await;
                 let tx = self.internal_tx.clone();
                 let resolver = self.resolver();
                 tokio::spawn(async move {
@@ -1337,6 +1406,27 @@ impl Service {
                 });
             }
         }
+    }
+
+    /// Stops the previous song when the next one has to be looked up online first: it would
+    /// otherwise play on meanwhile, and its end would skip the new one. During a crossfade the
+    /// previous song is on its own player and nothing is playing here.
+    async fn silence_engine(&mut self) {
+        match self.engine {
+            Engine::Mpv => {
+                if let Some(mpv) = &self.mpv {
+                    let _ = mpv.stop().await;
+                }
+            }
+            Engine::Spotify => {
+                if let Some(sp) = &self.spotify {
+                    sp.stop();
+                }
+            }
+            Engine::None => {}
+        }
+        self.engine = Engine::None;
+        self.mpv_preloaded = None;
     }
 
     async fn dispatch_resolved(&mut self, original: Track, resolved: Option<Track>, start: f64) {
@@ -1434,6 +1524,7 @@ impl Service {
         }
         self.engine = Engine::Mpv;
         self.mpv_preloaded = None;
+        self.mpv_entry = None;
         self.playing = Some(track);
         let volume = self.start_volume();
         if let Some(mpv) = &self.mpv {
@@ -1450,41 +1541,29 @@ impl Service {
                 .await;
             return;
         }
-        if self.spotify.is_none() {
-            self.set_account(|f| &mut f.spotify, AccountStatus::Working("Connecting…".into()));
-            let r = SpotifyEngine::connect(
-                &self.spotify_auth,
-                &self.paths.spotify_dir(),
-                self.spotify_audio_cache(),
-                &self.cfg.spotify,
-                self.cfg.playback.volume,
-                self.spotify_tx.clone(),
-            )
-            .await;
-            match r {
-                Ok(engine) => {
-                    self.set_account(|f| &mut f.spotify, AccountStatus::Connected(engine.username.clone()));
-                    self.spotify = Some(engine);
-                }
-                Err(e) => {
-                    self.set_account(|f| &mut f.spotify, AccountStatus::Error(format!("{e:#}")));
-                    self.load_failed(format!("Spotify: {e:#}")).await;
-                    return;
-                }
+        // A session that dropped (network change, sleep) is replaced by a new connection.
+        if self.spotify.as_ref().is_some_and(|sp| sp.session().is_none()) {
+            tracing::info!("Spotify session lost, connecting again");
+            if let Some(sp) = self.spotify.take() {
+                sp.shutdown();
             }
+        }
+        if self.spotify.is_none() {
+            // Connecting takes a few seconds: in the background, so everything else (other
+            // buttons, media keys, a crossfade) carries on. The song starts once connected.
+            self.silence_engine().await;
+            self.set_account(|f| &mut f.spotify, AccountStatus::Working("Connecting…".into()));
+            self.spotify_pending_play = Some((self.load_seq, track, start));
+            self.connect_spotify();
+            return;
         }
         if self.engine == Engine::Mpv {
             if let Some(mpv) = &self.mpv {
                 let _ = mpv.stop().await;
             }
         }
-        let auth = self.spotify_auth.clone();
         let volume = self.start_volume();
         let Some(sp) = self.spotify.as_mut() else { return };
-        if let Err(e) = sp.ensure_session(&auth).await {
-            self.load_failed(format!("Spotify: {e:#}")).await;
-            return;
-        }
         self.engine = Engine::Spotify;
         self.playing = Some(track.clone());
         sp.set_volume(volume);
@@ -1533,7 +1612,11 @@ impl Service {
         };
         self.detect_quality();
         let now = now_unix();
-        let _ = self.db.record_play(&track.id, now);
+        // The song from last time, picked up where it stopped: already counted and scrobbled.
+        let resumed = self.resumed_scrobbled.take().is_some_and(|id| id == track.id);
+        if !resumed {
+            let _ = self.db.record_play(&track.id, now);
+        }
         {
             let mut lib = self.shared.library.write().unwrap();
             lib.recent.retain(|id| id != &track.id);
@@ -1546,6 +1629,9 @@ impl Service {
             lib.version += 1;
         }
         self.scrobble.start(&track.id, track.duration_ms, now);
+        if resumed {
+            self.scrobble.mark_scrobbled();
+        }
         // In instant mode this scrobbles right away.
         self.scrobble_if_due();
         if let Some(lfm) = self.lastfm.clone() {
@@ -1612,6 +1698,12 @@ impl Service {
     }
 
     async fn pause(&mut self) {
+        if self.status == PlayStatus::Loading {
+            // Loading would start it playing: it starts paused instead.
+            self.pause_wanted = true;
+            self.publish_player();
+            return;
+        }
         self.cancel_fades().await;
         match self.engine {
             Engine::Mpv => {
@@ -1632,6 +1724,12 @@ impl Service {
     }
 
     async fn resume(&mut self) {
+        if self.status == PlayStatus::Loading {
+            // Already on its way; just don't start it paused.
+            self.pause_wanted = false;
+            self.publish_player();
+            return;
+        }
         if self.playing.is_none() || self.engine == Engine::None {
             // Nothing loaded yet (fresh start with a restored session).
             if self.queue.current().is_some() {
@@ -1661,7 +1759,8 @@ impl Service {
     async fn seek(&mut self, secs: f64) {
         self.cancel_fades().await;
         let secs = if self.duration > 0.0 {
-            secs.clamp(0.0, self.duration - 0.5)
+            // Songs under half a second exist; clamp would panic with max < min.
+            secs.clamp(0.0, (self.duration - 0.5).max(0.0))
         } else {
             secs.max(0.0)
         };
@@ -1769,6 +1868,12 @@ impl Service {
                 let start = self.resume_position.take().unwrap_or(self.position);
                 self.set_position(start);
                 self.status = PlayStatus::Playing;
+                if std::mem::take(&mut self.pause_wanted) {
+                    if let Some(mpv) = &self.mpv {
+                        let _ = mpv.set_pause(true).await;
+                    }
+                    self.status = PlayStatus::Paused;
+                }
                 self.on_track_started();
                 if self.playing.as_ref().is_some_and(|t| t.source == Source::SoundCloud) {
                     self.quality = self.mpv_stream_quality().await;
@@ -1789,7 +1894,16 @@ impl Service {
                     self.publish_player();
                 }
             }
-            MpvEvent::EndFile { reason, error } => match reason.as_str() {
+            MpvEvent::EndFile { playlist_entry_id, .. } if self.mpv_entry != Some(playlist_entry_id) => {
+                // A file that ended as another one was asked for: not the current song.
+                tracing::debug!("mpv: ignoring the end of entry {playlist_entry_id}");
+            }
+            MpvEvent::EndFile { reason, error, .. } => match reason.as_str() {
+                "eof" | "error" if self.stream_broke_off() => {
+                    let at = self.current_position();
+                    tracing::warn!("mpv: the stream stopped at {at:.0}s ({reason}); loading it again");
+                    self.reload_at(at).await;
+                }
                 "eof" => {
                     if let Some(pre) = self.mpv_preloaded.take() {
                         // mpv continues into the appended file by itself.
@@ -1827,7 +1941,8 @@ impl Service {
                 }
                 _ => {}
             },
-            MpvEvent::StartFile { .. } | MpvEvent::Died => {}
+            MpvEvent::StartFile { playlist_entry_id } => self.mpv_entry = Some(playlist_entry_id),
+            MpvEvent::Died => {}
         }
     }
 
@@ -1841,6 +1956,12 @@ impl Service {
             SpotifyEvent::Playing { position_ms } => {
                 self.set_position(position_ms as f64 / 1000.0);
                 self.status = PlayStatus::Playing;
+                if std::mem::take(&mut self.pause_wanted) {
+                    if let Some(sp) = &self.spotify {
+                        sp.pause();
+                    }
+                    self.status = PlayStatus::Paused;
+                }
                 self.on_track_started();
                 self.publish_player();
                 self.update_presence();
@@ -1864,7 +1985,19 @@ impl Service {
                     }
                 }
             }
-            SpotifyEvent::EndOfTrack => {
+            SpotifyEvent::EndOfTrack { uri } if !self.is_playing_uri(&uri) => {
+                tracing::debug!("Spotify: ignoring the end of {uri}");
+            }
+            SpotifyEvent::EndOfTrack { .. } if self.stream_broke_off() => {
+                let at = self.current_position();
+                tracing::warn!("Spotify: the song stopped at {at:.0}s; connecting again");
+                // Usually the connection dropped: start over with a new one if so.
+                if self.spotify.as_ref().is_some_and(|sp| sp.session().is_none()) {
+                    self.engine = Engine::None;
+                }
+                self.reload_at(at).await;
+            }
+            SpotifyEvent::EndOfTrack { .. } => {
                 if self.queue.advance(false).is_some() {
                     self.play_current(0.0).await;
                 } else {
@@ -1872,13 +2005,55 @@ impl Service {
                 }
                 self.publish_queue();
             }
-            SpotifyEvent::Unavailable => {
+            SpotifyEvent::Unavailable { uri } if !self.is_playing_uri(&uri) => {
+                // The next song couldn't be preloaded. The current one plays on; the next one
+                // fails with its own name if it still can't be played when its turn comes.
+                tracing::warn!("Spotify: {uri} can't be preloaded");
+            }
+            SpotifyEvent::Unavailable { .. } => {
                 let name = self.playing.as_ref().map(|t| t.title.clone()).unwrap_or_default();
                 self.load_failed(format!("“{name}” is not available on Spotify in your region"))
                     .await;
             }
             SpotifyEvent::Stopped => {}
         }
+    }
+
+    /// Whether the streamed song that just ended stopped well before its end (the connection
+    /// dropped, or a stream link expired during a long pause), and hasn't been retried yet.
+    fn stream_broke_off(&self) -> bool {
+        let streamed = self
+            .playing
+            .as_ref()
+            .is_some_and(|t| t.source != Source::Local && self.file_of(t).is_none());
+        let position = self.current_position();
+        streamed
+            && self.retried_load != self.load_seq
+            && self.started_reported
+            && self.duration > 30.0
+            && position > 1.0
+            && position < self.duration - 5.0
+    }
+
+    /// Plays the current song again from `at` after its stream broke off. It is the same
+    /// play: no second play count or scrobble.
+    async fn reload_at(&mut self, at: f64) {
+        let Some(track) = self.queue.current().cloned() else {
+            return;
+        };
+        self.load_seq += 1;
+        self.retried_load = self.load_seq;
+        self.playing = None;
+        self.set_position(at);
+        self.status = PlayStatus::Loading;
+        self.publish_player();
+        self.dispatch(track, at).await;
+    }
+
+    /// Whether a Spotify event about `uri` is about the song playing now (an empty `uri` is
+    /// taken as the current one).
+    fn is_playing_uri(&self, uri: &str) -> bool {
+        uri.is_empty() || self.playing.as_ref().is_some_and(|t| t.uri == uri)
     }
 
     async fn on_tick(&mut self) {
@@ -1894,6 +2069,13 @@ impl Service {
             }
         }
 
+        // The queue when it changed; where in the song we are every 15 s, so a crash or power
+        // cut picks up close to where it stopped.
+        if std::mem::take(&mut self.session_dirty) {
+            self.save_session();
+        } else if playing && self.position_saved_at.elapsed() >= Duration::from_secs(15) {
+            self.save_position();
+        }
         // Save the volume once it stops changing (a drag sends dozens of changes).
         if self.volume_changed_at.is_some_and(|t| t.elapsed() >= VOLUME_SAVE_DELAY) {
             self.volume_changed_at = None;
@@ -1932,6 +2114,20 @@ impl Service {
                         Ok(None) => {}
                         // Usually bad tags on a local file; silently missing scrobbles are worse.
                         Ok(Some(why)) => shared.error(format!("Not scrobbled: {why}")),
+                        // The login was revoked (or the key changed): scrobbles wait in the queue
+                        // (for 14 days) until Last.fm is connected again.
+                        Err(e) if crate::integrations::lastfm::is_auth_error(&e) => {
+                            tracing::warn!("scrobble refused: {e:#}");
+                            let mut feed = shared.feed.write().unwrap();
+                            if !matches!(feed.lastfm, AccountStatus::Error(_)) {
+                                feed.lastfm = AccountStatus::Error(
+                                    "Last.fm logged Sumo out: connect again in Settings (scrobbles are kept meanwhile)"
+                                        .into(),
+                                );
+                                drop(feed);
+                                shared.error("Last.fm logged Sumo out: connect again in Settings to keep scrobbling");
+                            }
+                        }
                         Err(e) => tracing::warn!("scrobble failed: {e:#}"),
                     }
                 });
@@ -2149,7 +2345,12 @@ impl Service {
                 }
             }
             pv.current = current;
-            pv.status = self.status;
+            // A song that will start paused shows as paused while it loads.
+            pv.status = if self.status == PlayStatus::Loading && self.pause_wanted {
+                PlayStatus::Paused
+            } else {
+                self.status
+            };
             pv.position = self.position;
             pv.position_at = self.position_at;
             pv.duration = self.duration;
@@ -2157,6 +2358,7 @@ impl Service {
             pv.shuffle = self.queue.shuffle;
             pv.repeat = self.queue.repeat;
             pv.context = self.queue.context_name.clone();
+            pv.context_first = self.queue.context_first().map(|t| t.id.clone());
             pv.quality = self.quality.clone();
         }
         self.mpris.update(
@@ -2168,6 +2370,7 @@ impl Service {
     }
 
     fn publish_queue(&mut self) {
+        self.session_dirty = true;
         {
             let mut pv = self.shared.player.write().unwrap();
             pv.upcoming = self.queue.upcoming(200);
@@ -2238,13 +2441,15 @@ impl Service {
     fn request_lyrics(&self, track: &Track) {
         {
             let mut feed = self.shared.feed.write().unwrap();
-            if feed.lyrics.track_id == track.id {
+            // Again for the same song only when lyrics were just turned on or off.
+            if feed.lyrics.track_id == track.id && feed.lyrics.off != self.cfg.lyrics.enabled {
                 return;
             }
             feed.lyrics = LyricsState {
                 track_id: track.id.clone(),
                 loading: self.cfg.lyrics.enabled,
                 lyrics: None,
+                off: !self.cfg.lyrics.enabled,
             };
         }
         if !self.cfg.lyrics.enabled {
@@ -2285,8 +2490,11 @@ impl Service {
 
     /// Saves/replaces playlists, deletes `remove`, then reindexes.
     fn save_playlists(&mut self, playlists: Vec<Playlist>, remove: &[String]) {
-        {
+        // The library is only locked while it changes; the UI waits on that lock, so the
+        // database (only the playlists that changed) is written after.
+        let (changed, order) = {
             let mut lib = self.shared.library.write().unwrap();
+            let ids: HashSet<String> = playlists.iter().map(|p| p.id.clone()).collect();
             for p in playlists {
                 match lib.playlists.iter_mut().find(|x| x.id == p.id) {
                     Some(existing) => *existing = p,
@@ -2295,16 +2503,29 @@ impl Service {
             }
             lib.playlists.retain(|p| !remove.contains(&p.id));
             lib.reindex();
-            for (i, p) in lib.playlists.iter().enumerate() {
-                if let Err(e) = self.db.save_playlist(p, i as i64) {
-                    tracing::error!("saving playlist {}: {e:#}", p.id);
-                }
+            let changed: Vec<(Playlist, i64)> = lib
+                .playlists
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| ids.contains(&p.id))
+                .map(|(i, p)| (p.clone(), i as i64))
+                .collect();
+            let order: Vec<String> = lib.playlists.iter().map(|p| p.id.clone()).collect();
+            (changed, order)
+        };
+        self.shared.repaint();
+        for (p, position) in &changed {
+            if let Err(e) = self.db.save_playlist(p, *position) {
+                tracing::error!("saving playlist {}: {e:#}", p.id);
             }
         }
         for id in remove {
             let _ = self.db.delete_playlist(id);
         }
-        self.shared.repaint();
+        // Cheap (one number per playlist) and keeps the order right after adds and removals.
+        if let Err(e) = self.db.set_playlist_order(&order) {
+            tracing::error!("saving the playlist order: {e:#}");
+        }
     }
 
     /// Saves the album on the open page to the library's albums (and to Spotify's library when
@@ -2392,17 +2613,38 @@ impl Service {
         if let (Source::Spotify, Some(auth)) = (track.source, self.user_web_auth()) {
             let api = self.spotify_api.clone();
             let t = track.clone();
+            let shared = self.shared.clone();
             tokio::spawn(async move {
-                if let Ok(token) = auth.token().await {
-                    if let Err(e) = api.set_liked(&token, &t.uri, liked_now).await {
-                        tracing::warn!("Spotify like sync failed: {e:#}");
-                    }
+                let result = match auth.token().await {
+                    Ok(token) => api.set_liked(&token, &t.uri, liked_now).await,
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = result {
+                    tracing::warn!("Spotify like sync failed: {e:#}");
+                    shared.error(format!(
+                        "Couldn't {} “{}” on Spotify: {e:#}",
+                        if liked_now { "like" } else { "unlike" },
+                        t.title
+                    ));
                 }
             });
         }
-        if let Some(lfm) = self.lastfm.clone() {
+        // Loved on Last.fm too when logged in there (songs without an artist can't be).
+        if let Some(lfm) = self
+            .lastfm
+            .clone()
+            .filter(|l| l.is_authenticated() && !track.artist.trim().is_empty())
+        {
+            let shared = self.shared.clone();
             tokio::spawn(async move {
-                let _ = lfm.love(&track, liked_now).await;
+                if let Err(e) = lfm.love(&track, liked_now).await {
+                    tracing::warn!("Last.fm love failed: {e:#}");
+                    shared.error(format!(
+                        "Couldn't {} “{}” on Last.fm",
+                        if liked_now { "love" } else { "unlove" },
+                        track.title
+                    ));
+                }
             });
         }
     }
@@ -2663,15 +2905,20 @@ impl Service {
         let _ = self.db.set_kv("spotify_user", &sync.user);
         let mut tracks = Vec::new();
         let mut playlists = Vec::new();
-        let existing: HashMap<String, Vec<String>> = {
+        let existing: HashMap<String, Playlist> = {
             let lib = self.shared.library.read().unwrap();
-            lib.playlists
-                .iter()
-                .map(|p| (p.id.clone(), p.track_ids.clone()))
-                .collect()
+            lib.playlists.iter().map(|p| (p.id.clone(), p.clone())).collect()
         };
         tracks.extend(sync.tracks);
-        let liked_ids = sync.liked;
+        // What couldn't be loaded this time stays as it was.
+        let liked_ids = sync.liked.unwrap_or_else(|| {
+            self.shared
+                .error("Spotify Liked Songs couldn't be loaded this time; they stay as they were");
+            existing
+                .get("spotify:liked")
+                .map(|p| p.track_ids.clone())
+                .unwrap_or_default()
+        });
         playlists.push(Playlist {
             id: "spotify:liked".into(),
             name: "Liked Songs".into(),
@@ -2691,7 +2938,7 @@ impl Service {
                         .set_kv(&format!("spotify_snapshot:{}", meta.id), &meta.snapshot_id);
                     ids
                 }
-                None => existing.get(&id).cloned().unwrap_or_default(),
+                None => existing.get(&id).map(|p| p.track_ids.clone()).unwrap_or_default(),
             };
             playlists.push(Playlist {
                 id,
@@ -2702,6 +2949,18 @@ impl Service {
                 art: meta.art,
                 track_ids,
             });
+        }
+        let kept = sync.kept.len();
+        playlists.extend(
+            sync.kept
+                .iter()
+                .filter_map(|id| existing.get(&format!("spotify:{id}")).cloned()),
+        );
+        if kept > 0 {
+            self.shared.error(format!(
+                "{kept} Spotify playlist{} couldn't be loaded this time and stay as they were",
+                if kept == 1 { "" } else { "s" }
+            ));
         }
         let albums = sync.albums.len();
         playlists.extend(sync.albums);
@@ -2739,9 +2998,9 @@ impl Service {
                     sc.resolve_user(&profile).await?
                 };
                 let likes = sc.likes(user.id).await?;
-                let playlists = sc.playlists(user.id).await.unwrap_or_else(|e| {
+                let playlists = sc.playlists(user.id).await.map_err(|e| {
                     tracing::warn!("SoundCloud playlists: {e:#}");
-                    Vec::new()
+                    format!("{e:#}")
                 });
                 Ok(SoundCloudSync {
                     user: user.username,
@@ -2766,8 +3025,18 @@ impl Service {
             track_ids: sync.likes.iter().map(|t| t.id.clone()).collect(),
         }];
         tracks.extend(sync.likes);
-        let count = sync.playlists.len();
-        for p in sync.playlists {
+        // Playlists that couldn't be loaded stay as they were (not taken for deleted).
+        let (lists, prune) = match sync.playlists {
+            Ok(lists) => (lists, &[PlaylistKind::SoundCloud, PlaylistKind::SoundCloudLikes][..]),
+            Err(e) => {
+                self.shared.error(format!(
+                    "SoundCloud playlists couldn't be loaded ({e}); they stay as they were"
+                ));
+                (Vec::new(), &[PlaylistKind::SoundCloudLikes][..])
+            }
+        };
+        let count = lists.len();
+        for p in lists {
             playlists.push(Playlist {
                 id: format!("soundcloud:pl:{}", p.remote_id),
                 name: p.name,
@@ -2779,11 +3048,7 @@ impl Service {
             });
             tracks.extend(p.tracks);
         }
-        self.merge_imported(
-            tracks,
-            playlists,
-            &[PlaylistKind::SoundCloud, PlaylistKind::SoundCloudLikes],
-        );
+        self.merge_imported(tracks, playlists, prune);
         let _ = self.db.set_kv("soundcloud_user", &sync.user);
         let _ = self.db.set_kv("soundcloud_synced_at", &now_unix().to_string());
         self.set_account(|f| &mut f.soundcloud, AccountStatus::Connected(sync.user));
@@ -3721,7 +3986,12 @@ impl Service {
                     drop(feed);
                     shared.repaint();
                 };
-                let result = downloader.download(&track, &dir, &job_work, &progress).await;
+                // A bug in one download must still free its place and show as failed.
+                let result = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                    downloader.download(&track, &dir, &job_work, &progress),
+                ))
+                .await
+                .unwrap_or_else(|_| Err(anyhow!("the download stopped unexpectedly")));
                 let _ = tx.send(Internal::DownloadDone { track, result });
             });
             self.download_jobs.insert(job_id, (task.abort_handle(), work));
@@ -3992,6 +4262,9 @@ impl Service {
                 LyricsFetcher::new(self.http.clone(), self.paths.lyrics_cache(), self.cfg.lyrics.online)
                     .with_genius(genius::shared()),
             );
+            if let Some(t) = self.queue.current().cloned() {
+                self.request_lyrics(&t);
+            }
         }
         if old.spotify.web_api_client_id != self.cfg.spotify.web_api_client_id
             || old.spotify.web_api_redirect() != self.cfg.spotify.web_api_redirect()
@@ -4029,25 +4302,47 @@ impl Service {
 
     // ---------------------------------------------------------------- session
 
-    fn save_session(&self) {
-        let mut tracks: Vec<Track> = Vec::new();
-        if let Some(c) = self.queue.current() {
-            tracks.push(c.clone());
-        }
-        tracks.extend(self.queue.upcoming(500));
-        if tracks.is_empty() {
+    fn save_session(&mut self) {
+        if self.queue.current().is_none() {
             return;
         }
+        let extra: Vec<Track> = {
+            let lib = self.shared.library.read().unwrap();
+            let mut seen = HashSet::new();
+            self.queue
+                .all_tracks()
+                .filter(|t| !lib.tracks.contains_key(&t.id) && seen.insert(t.id.as_str()))
+                .cloned()
+                .collect()
+        };
         let session = SavedSession {
-            tracks: tracks.iter().map(|t| t.id.clone()).collect(),
+            tracks: Vec::new(),
             index: 0,
             position: self.current_position(),
             context: self.queue.context_name.clone(),
             shuffle: self.queue.shuffle,
             repeat: self.queue.repeat,
+            queue: Some(self.queue.state()),
+            extra,
         };
         if let Ok(text) = serde_json::to_string(&session) {
             let _ = self.db.set_kv("session", &text);
+        }
+        self.save_position();
+    }
+
+    fn save_position(&mut self) {
+        self.position_saved_at = Instant::now();
+        let Some(track) = self.queue.current() else {
+            return;
+        };
+        let saved = SavedPosition {
+            track: track.id.clone(),
+            position: self.current_position(),
+            scrobbled: self.scrobble.scrobbled(&track.id),
+        };
+        if let Ok(text) = serde_json::to_string(&saved) {
+            let _ = self.db.set_kv("session_position", &text);
         }
     }
 
@@ -4059,19 +4354,46 @@ impl Service {
         else {
             return;
         };
-        let tracks = self.shared.library.read().unwrap().tracks_for(&session.tracks);
-        if tracks.is_empty() {
+        let restored = match session.queue.clone() {
+            Some(state) => {
+                let lib = self.shared.library.read().unwrap();
+                let extra: HashMap<&str, &Track> = session.extra.iter().map(|t| (t.id.as_str(), t)).collect();
+                let song = |id: &str| lib.tracks.get(id).or_else(|| extra.get(id).copied()).cloned();
+                self.queue.restore(state, song)
+            }
+            None => false,
+        };
+        if !restored {
+            // A session from before 0.5.3, or one whose songs are gone: what is still there.
+            let ids: Vec<String> = match &session.queue {
+                Some(state) => state.current.iter().chain(&state.tracks).cloned().collect(),
+                None => session.tracks.clone(),
+            };
+            let tracks = self.shared.library.read().unwrap().tracks_for(&ids);
+            if tracks.is_empty() {
+                return;
+            }
+            self.queue.repeat = session.repeat;
+            self.queue.set_context(tracks, session.index, session.context);
+            self.queue.shuffle = session.shuffle;
+        }
+        let Some(current) = self.queue.current().cloned() else {
             return;
+        };
+        self.duration = current.duration_secs();
+        self.request_lyrics(&current);
+        // The position saved during playback is newer than the one saved with the queue.
+        let saved = self
+            .db
+            .get_kv("session_position")
+            .and_then(|s| serde_json::from_str::<SavedPosition>(&s).ok())
+            .filter(|p| p.track == current.id);
+        let position = saved.as_ref().map_or(session.position, |p| p.position);
+        if saved.is_some_and(|p| p.scrobbled) {
+            self.resumed_scrobbled = Some(current.id.clone());
         }
-        self.queue.repeat = session.repeat;
-        self.queue.set_context(tracks, session.index, session.context);
-        self.queue.shuffle = session.shuffle;
-        if let Some(t) = self.queue.current().cloned() {
-            self.duration = t.duration_secs();
-            self.request_lyrics(&t);
-        }
-        self.resume_position = Some(session.position);
-        self.set_position(session.position);
+        self.resume_position = Some(position);
+        self.set_position(position);
         self.status = PlayStatus::Paused;
     }
 
@@ -4109,6 +4431,11 @@ impl Service {
                         } else {
                             engine.shutdown();
                         }
+                        if let Some((seq, track, start)) = self.spotify_pending_play.take() {
+                            if seq == self.load_seq {
+                                self.start_spotify(track, start).await;
+                            }
+                        }
                         if std::mem::take(&mut self.spotify_sync_pending) {
                             self.start_spotify_sync();
                         } else if !self.spotify_syncing {
@@ -4121,6 +4448,11 @@ impl Service {
                     }
                     Err(e) => {
                         tracing::warn!("Spotify connect failed: {e:#}");
+                        if let Some((seq, ..)) = self.spotify_pending_play.take() {
+                            if seq == self.load_seq {
+                                self.load_failed(format!("Spotify: {e:#}")).await;
+                            }
+                        }
                         self.set_account(
                             |f| &mut f.spotify,
                             AccountStatus::Error(format!("Couldn't connect: {e:#}")),
@@ -4573,6 +4905,7 @@ async fn spotify_sync_internal(
     let ids = timed("loading your playlists", si::rootlist(&session)).await?;
     let total = ids.len();
     let mut lists = Vec::with_capacity(total);
+    let mut kept = Vec::new();
     {
         let mut results = futures_util::stream::iter(ids)
             .map(|id| {
@@ -4589,17 +4922,20 @@ async fn spotify_sync_internal(
             progress(format!("Loading playlists… {done}/{total}"));
             match result {
                 Ok(p) => lists.push(p),
-                Err(e) => tracing::warn!("skipping Spotify playlist {id}: {e:#}"),
+                Err(e) => {
+                    tracing::warn!("keeping Spotify playlist {id} as it was: {e:#}");
+                    kept.push(id);
+                }
             }
         }
     }
     progress("Loading Liked Songs and albums…".into());
     let collection = timed("loading Liked Songs", si::collection(&session))
         .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("Spotify Liked Songs: {e:#}");
-            Vec::new()
-        });
+        .map_err(|e| tracing::warn!("Spotify Liked Songs: {e:#}"))
+        .ok();
+    let liked_loaded = collection.is_some();
+    let collection = collection.unwrap_or_default();
     let liked: Vec<(String, i64)> = collection
         .iter()
         .filter(|(uri, _)| uri.starts_with("spotify:track:"))
@@ -4696,7 +5032,8 @@ async fn spotify_sync_internal(
     Ok(SpotifySync {
         user,
         playlists,
-        liked: liked_ids,
+        liked: liked_loaded.then_some(liked_ids),
+        kept,
         albums,
         tracks: fetched.into_values().chain(album_tracks).collect(),
     })
@@ -4749,7 +5086,8 @@ async fn spotify_sync_web(
             user.display_name
         },
         playlists,
-        liked: liked_ids,
+        liked: Some(liked_ids),
+        kept: Vec::new(),
         // The Web API fallback doesn't bring in saved albums.
         albums: Vec::new(),
         tracks,
@@ -5490,6 +5828,27 @@ mod tests {
             links::target(&url),
             Some(Target::Spotify(LinkKind::Album, "4m2880jivSbbyEGAKfITCa".into()))
         );
+    }
+
+    /// Sessions saved by older versions still load (they come back as a plain list).
+    #[test]
+    fn old_sessions_still_load() {
+        let old = r#"{"tracks":["a","b"],"index":0,"position":12.5,"context":"Mix","shuffle":true,"repeat":"All"}"#;
+        let s: SavedSession = serde_json::from_str(old).unwrap();
+        assert_eq!((s.tracks.len(), s.position, s.repeat), (2, 12.5, RepeatMode::All));
+        assert!(s.queue.is_none() && s.extra.is_empty());
+        let new = SavedSession {
+            tracks: Vec::new(),
+            index: 0,
+            position: 3.0,
+            context: String::new(),
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            queue: Some(QueueState::default()),
+            extra: Vec::new(),
+        };
+        let back: SavedSession = serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+        assert_eq!(back.queue, Some(QueueState::default()));
     }
 
     #[test]

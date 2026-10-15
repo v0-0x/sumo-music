@@ -889,6 +889,13 @@ impl ScrobbleTracker {
         }
     }
 
+    /// Whether `track_id` is the tracked track and was scrobbled already.
+    pub fn scrobbled(&self, track_id: &str) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|t| t.track_id == track_id && t.scrobbled)
+    }
+
     /// `(track_id, started_at)` of the tracked track.
     pub fn current(&self) -> Option<(&str, i64)> {
         self.current.as_ref().map(|t| (t.track_id.as_str(), t.started_at))

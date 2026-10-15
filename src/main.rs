@@ -49,6 +49,11 @@ fn main() -> anyhow::Result<()> {
         None => tracing_subscriber::fmt().with_env_filter(filter).init(),
     }
     tracing::info!("Sumo {} starting", env!("CARGO_PKG_VERSION"));
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!("panic: {info}");
+        default_hook(info);
+    }));
 
     // Windows: starting Sumo again brings the running one to the front.
     #[cfg(windows)]
@@ -99,11 +104,11 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
     rt.shutdown_timeout(Duration::from_millis(500));
-    // Imported settings take effect in a fresh start.
+    // Imported settings take effect in a fresh start; a restart may also have been asked for.
     if shared
         .feed
         .read()
-        .map(|f| f.imported_settings.is_some())
+        .map(|f| f.imported_settings.is_some() || f.restart)
         .unwrap_or(false)
     {
         if let Ok(exe) = std::env::current_exe() {

@@ -534,10 +534,12 @@ impl SoundCloud {
             let _ = tokio::fs::remove_file(&part).await;
             bail!("\"{title}\" didn't download as an audio file");
         };
-        let path = unique_path(dir, &stem, ext);
-        tokio::fs::rename(&part, &path)
-            .await
-            .with_context(|| format!("couldn't save {}", path.display()))?;
+        let path = {
+            let (part, folder, stem) = (part.clone(), dir.to_path_buf(), stem.clone());
+            tokio::task::spawn_blocking(move || save_unique(&part, &folder, &stem, ext))
+                .await?
+                .with_context(|| format!("couldn't save \"{title}\" in {}", dir.display()))?
+        };
         info!("SoundCloud: saved \"{title}\" to {}", path.display());
         Ok(ScDownload {
             path,
@@ -1328,15 +1330,28 @@ pub fn file_stem(artist: &str, title: &str) -> String {
 }
 
 /// `dir/stem.ext`, or `dir/stem (2).ext` and so on if that exists.
-pub fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
-    let first = dir.join(format!("{stem}.{ext}"));
-    if !first.exists() {
-        return first;
+/// Moves a finished file to the first free "stem.ext" / "stem (2).ext" … in `dir`. The name is
+/// claimed by creating it, so two downloads finishing at once never take the same one.
+pub fn save_unique(file: &Path, dir: &Path, stem: &str, ext: &str) -> std::io::Result<PathBuf> {
+    let names = std::iter::once(format!("{stem}.{ext}")).chain((2..1000).map(|n| format!("{stem} ({n}).{ext}")));
+    for name in names {
+        let target = dir.join(name);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&target) {
+            Ok(_) => {
+                // Replaces the empty file just made.
+                return match std::fs::rename(file, &target) {
+                    Ok(()) => Ok(target),
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&target);
+                        Err(e)
+                    }
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
     }
-    (2..1000)
-        .map(|n| dir.join(format!("{stem} ({n}).{ext}")))
-        .find(|p| !p.exists())
-        .unwrap_or(first)
+    Err(std::io::Error::other("too many files with this name"))
 }
 
 /// Streams mpv can play, best first: HLS MP3 > HLS Opus > progressive MP3 > HLS AAC > anything
@@ -2075,11 +2090,21 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("multimusic-names-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let first = unique_path(&dir, "Song", "mp3");
+        let part = |name: &str, data: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, data).unwrap();
+            p
+        };
+        // Free names first, then numbered ones; saving claims the name, so files finishing
+        // together never overwrite each other.
+        let first = save_unique(&part("a.part", b"A"), &dir, "Song", "mp3").unwrap();
         assert_eq!(first, dir.join("Song.mp3"));
-        std::fs::write(&first, b"x").unwrap();
-        assert_eq!(unique_path(&dir, "Song", "mp3"), dir.join("Song (2).mp3"));
-        assert_eq!(unique_path(&dir, "Song", "flac"), dir.join("Song.flac"));
+        let second = save_unique(&part("b.part", b"B"), &dir, "Song", "mp3").unwrap();
+        assert_eq!(second, dir.join("Song (2).mp3"));
+        let flac = save_unique(&part("c.part", b"C"), &dir, "Song", "flac").unwrap();
+        assert_eq!(flac, dir.join("Song.flac"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"A");
+        assert_eq!(std::fs::read(&second).unwrap(), b"B");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

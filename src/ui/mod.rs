@@ -784,6 +784,26 @@ impl App {
         }
     }
 
+    /// The player runs in the background; if it stopped (a bug), nothing would respond anymore.
+    /// Say so and offer to start Sumo again instead of leaving dead buttons.
+    fn service_stopped(&mut self, ctx: &egui::Context) {
+        if !self.cmd.is_closed() || self.restarting {
+            return;
+        }
+        egui::Modal::new(egui::Id::new("service-stopped")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.label(egui::RichText::new("Sumo's player stopped").font(theme::bold_font(18.0)));
+            ui.add_space(8.0);
+            ui.label("Something went wrong in the background, so playback and the buttons won't respond. Your library and playlists are safe.");
+            ui.add_space(12.0);
+            if widgets::pill(ui, "Restart Sumo", self.accent, theme::on_color(self.accent)).clicked() {
+                self.restarting = true;
+                self.shared.feed.write().unwrap().restart = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        });
+    }
+
     fn tag_editor(&mut self, ctx: &egui::Context) {
         let shared = self.shared.clone();
         let feed = shared.feed.read().unwrap();
@@ -1036,7 +1056,9 @@ impl eframe::App for App {
         }
         // A library artist's page also shows their songs on Spotify and SoundCloud.
         if let View::Artist(key) = &self.view {
-            let name = self.shared.library.read().unwrap().artist(key).map(|a| a.name.clone());
+            // The library is already locked for this frame: locking it again could wait on a
+            // scan that waits on us.
+            let name = lib_guard.artist(key).map(|a| a.name.clone());
             if let Some(name) = name {
                 self.request_page(&format!("artist:{name}"));
             }
@@ -1077,6 +1099,7 @@ impl eframe::App for App {
 
         self.apply(&ctx, actions);
         self.dialogs(&ctx);
+        self.service_stopped(&ctx);
         self.tag_editor(&ctx);
         self.sync_config(&ctx);
         self.check_memory(&ctx);

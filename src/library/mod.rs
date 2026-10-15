@@ -75,12 +75,15 @@ impl Library {
     /// Recomputes derived data after tracks/playlists changed.
     pub fn reindex(&mut self) {
         let mut local: Vec<&Track> = self.tracks.values().filter(|t| t.source == Source::Local).collect();
-        local.sort_by(|a, b| {
-            sort_key(&a.artist)
-                .cmp(&sort_key(&b.artist))
-                .then_with(|| sort_key(&a.album).cmp(&sort_key(&b.album)))
-                .then_with(|| a.track_no.unwrap_or(0).cmp(&b.track_no.unwrap_or(0)))
-                .then_with(|| a.title.cmp(&b.title))
+        // Keys made once per song, not twice per comparison (big libraries re-sort on every
+        // change while the UI waits).
+        local.sort_by_cached_key(|t| {
+            (
+                sort_key(&t.artist),
+                sort_key(&t.album),
+                t.track_no.unwrap_or(0),
+                t.title.clone(),
+            )
         });
 
         let mut albums: Vec<Album> = Vec::new();
@@ -102,11 +105,7 @@ impl Library {
             albums[idx].track_ids.push(t.id.clone());
         }
         self.local = local.iter().map(|t| t.id.clone()).collect();
-        albums.sort_by(|a, b| {
-            sort_key(&a.artist)
-                .cmp(&sort_key(&b.artist))
-                .then_with(|| a.name.cmp(&b.name))
-        });
+        albums.sort_by_cached_key(|a| (sort_key(&a.artist), a.name.clone()));
         self.albums = albums;
 
         self.liked = self
@@ -166,12 +165,7 @@ impl Library {
                 )
             });
         }
-        artists.sort_by(|a, b| {
-            b.track_ids
-                .len()
-                .cmp(&a.track_ids.len())
-                .then_with(|| sort_key(&a.name).cmp(&sort_key(&b.name)))
-        });
+        artists.sort_by_cached_key(|a| (std::cmp::Reverse(a.track_ids.len()), sort_key(&a.name)));
         self.artist_index = artists.iter().enumerate().map(|(i, a)| (a.key.clone(), i)).collect();
         self.artists = artists;
     }

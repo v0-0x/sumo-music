@@ -310,11 +310,10 @@ async fn move_into(path: &Path, dir: &Path, stem: &str) -> Result<PathBuf> {
         .extension()
         .map(|e| e.to_string_lossy().to_string())
         .unwrap_or_else(|| "mp3".into());
-    let target = soundcloud::unique_path(dir, stem, &ext);
-    tokio::fs::rename(path, &target)
-        .await
-        .with_context(|| format!("couldn't save {}", target.display()))?;
-    Ok(target)
+    let (path, dir2, stem2) = (path.to_path_buf(), dir.to_path_buf(), stem.to_string());
+    tokio::task::spawn_blocking(move || soundcloud::save_unique(&path, &dir2, &stem2, &ext))
+        .await?
+        .with_context(|| format!("couldn't save it in {}", dir.display()))
 }
 
 /// Name of the work folder of download number `n`. Anything named like this in a download

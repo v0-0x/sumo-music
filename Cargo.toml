@@ -1,6 +1,6 @@
 [package]
 name = "multimusic"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 description = "A fast, lightweight, native music player for local files, Spotify and SoundCloud"
 license = "MIT"

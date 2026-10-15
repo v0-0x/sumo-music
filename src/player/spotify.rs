@@ -213,8 +213,14 @@ pub enum SpotifyEvent {
     },
     /// Good moment to preload the next track for gapless playback.
     TimeToPreload,
-    EndOfTrack,
-    Unavailable,
+    /// `uri` is the track that ended ("spotify:track:…").
+    EndOfTrack {
+        uri: String,
+    },
+    /// The track can't be played. It may be the next one, failing while it was preloaded.
+    Unavailable {
+        uri: String,
+    },
     Stopped,
 }
 
@@ -246,8 +252,6 @@ impl SpotifyDeck {
 
 pub struct SpotifyEngine {
     session: Session,
-    cache: Cache,
-    pub username: String,
     player_config: PlayerConfig,
     backend: audio_backend::SinkBuilder,
     events: SpotifySender,
@@ -270,7 +274,6 @@ impl SpotifyEngine {
         let cache = Cache::new(Some(dir), Some(dir), audio_cache.as_deref(), Some(2 << 30))
             .context("creating Spotify cache")?;
         let session = new_session(auth, &cache).await?;
-        let username = session.username();
 
         let (backend_name, backend) = select_backend(&cfg.audio_output)?;
         tracing::info!("Spotify audio output: {backend_name}");
@@ -289,8 +292,6 @@ impl SpotifyEngine {
         current.set_volume(volume);
         Ok(SpotifyEngine {
             session,
-            cache,
-            username,
             player_config,
             backend,
             events,
@@ -298,19 +299,6 @@ impl SpotifyEngine {
             current,
             spare: None,
         })
-    }
-
-    /// Reconnects if the session dropped (network change, suspend, ...).
-    pub async fn ensure_session(&mut self, auth: &SpotifyAuth) -> Result<()> {
-        if self.session.is_invalid() {
-            tracing::info!("Spotify session lost, reconnecting");
-            self.session = new_session(auth, &self.cache).await?;
-            self.current.player.set_session(self.session.clone());
-            if let Some(spare) = &self.spare {
-                spare.player.set_session(self.session.clone());
-            }
-        }
-        Ok(())
     }
 
     /// Id of the player for the current track (events from other players are stale).
@@ -399,25 +387,34 @@ fn new_deck(
     let events = events.clone();
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
-            let mapped = match ev {
-                PlayerEvent::Loading { .. } => SpotifyEvent::Loading,
-                PlayerEvent::Playing { position_ms, .. } => SpotifyEvent::Playing { position_ms },
-                PlayerEvent::Paused { position_ms, .. } => SpotifyEvent::Paused { position_ms },
-                PlayerEvent::Seeked { position_ms, .. } | PlayerEvent::PositionCorrection { position_ms, .. } => {
-                    SpotifyEvent::Seeked { position_ms }
-                }
-                PlayerEvent::TimeToPreloadNextTrack { .. } => SpotifyEvent::TimeToPreload,
-                PlayerEvent::EndOfTrack { .. } => SpotifyEvent::EndOfTrack,
-                PlayerEvent::Unavailable { .. } => SpotifyEvent::Unavailable,
-                PlayerEvent::Stopped { .. } => SpotifyEvent::Stopped,
-                _ => continue,
-            };
+            let Some(mapped) = map_event(ev) else { continue };
             if events.send((id, mapped)).is_err() {
                 break;
             }
         }
     });
     Ok(SpotifyDeck { id, player, mixer })
+}
+
+/// The player events Sumo acts on.
+fn map_event(ev: PlayerEvent) -> Option<SpotifyEvent> {
+    Some(match ev {
+        PlayerEvent::Loading { .. } => SpotifyEvent::Loading,
+        PlayerEvent::Playing { position_ms, .. } => SpotifyEvent::Playing { position_ms },
+        PlayerEvent::Paused { position_ms, .. } => SpotifyEvent::Paused { position_ms },
+        PlayerEvent::Seeked { position_ms, .. } | PlayerEvent::PositionCorrection { position_ms, .. } => {
+            SpotifyEvent::Seeked { position_ms }
+        }
+        PlayerEvent::TimeToPreloadNextTrack { .. } => SpotifyEvent::TimeToPreload,
+        PlayerEvent::EndOfTrack { track_id, .. } => SpotifyEvent::EndOfTrack {
+            uri: track_id.to_uri().unwrap_or_default(),
+        },
+        PlayerEvent::Unavailable { track_id, .. } => SpotifyEvent::Unavailable {
+            uri: track_id.to_uri().unwrap_or_default(),
+        },
+        PlayerEvent::Stopped { .. } => SpotifyEvent::Stopped,
+        _ => return None,
+    })
 }
 
 /// A software volume control for one player, silent until it is given a volume.
@@ -496,6 +493,38 @@ mod tests {
     use super::*;
     use librespot_playback::convert::Converter;
     use librespot_playback::decoder::AudioPacket;
+
+    /// End and failure events say which song they are about: a failing *next* song (being
+    /// preloaded) must not stop the current one.
+    #[test]
+    fn events_name_their_song() {
+        let id = || SpotifyUri::from_uri("spotify:track:4uLU6hMCjMI75M1A2tKUQC").unwrap();
+        assert_eq!(
+            map_event(PlayerEvent::Unavailable {
+                play_request_id: 2,
+                track_id: id(),
+            }),
+            Some(SpotifyEvent::Unavailable {
+                uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".into()
+            })
+        );
+        assert_eq!(
+            map_event(PlayerEvent::EndOfTrack {
+                play_request_id: 1,
+                track_id: id(),
+            }),
+            Some(SpotifyEvent::EndOfTrack {
+                uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".into()
+            })
+        );
+        assert_eq!(
+            map_event(PlayerEvent::SessionDisconnected {
+                connection_id: String::new(),
+                user_name: String::new()
+            }),
+            None
+        );
+    }
 
     #[test]
     fn volume_follows_mpvs_curve() {

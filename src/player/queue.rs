@@ -1,8 +1,9 @@
 //! Play queue: a context (album/playlist) with shuffle/repeat plus a user "up next" list.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use rand::seq::SliceRandom;
+use serde::{Deserialize, Serialize};
 
 use crate::model::{RepeatMode, Track};
 
@@ -18,15 +19,97 @@ pub struct Queue {
     up_next: VecDeque<Track>,
     /// The playing track (may come from `up_next`).
     current: Option<Track>,
+    /// Whether `current` came from `up_next` (the context is still at `pos`).
+    current_queued: bool,
+    /// Context tracks taken out of the queue (removed or cleared): they stay out when the
+    /// play order is made again (shuffle on or off).
+    removed: HashSet<usize>,
+    pub shuffle: bool,
+    pub repeat: RepeatMode,
+    pub context_name: String,
+}
+
+/// The whole queue as song ids, for saving between runs.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct QueueState {
+    pub tracks: Vec<String>,
+    pub order: Vec<usize>,
+    pub pos: Option<usize>,
+    pub up_next: Vec<String>,
+    pub current: Option<String>,
+    pub current_queued: bool,
+    pub removed: Vec<usize>,
     pub shuffle: bool,
     pub repeat: RepeatMode,
     pub context_name: String,
 }
 
 impl Queue {
+    pub fn state(&self) -> QueueState {
+        let mut removed: Vec<usize> = self.removed.iter().copied().collect();
+        removed.sort_unstable();
+        QueueState {
+            tracks: self.tracks.iter().map(|t| t.id.clone()).collect(),
+            order: self.order.clone(),
+            pos: self.pos,
+            up_next: self.up_next.iter().map(|t| t.id.clone()).collect(),
+            current: self.current.as_ref().map(|t| t.id.clone()),
+            current_queued: self.current_queued,
+            removed,
+            shuffle: self.shuffle,
+            repeat: self.repeat,
+            context_name: self.context_name.clone(),
+        }
+    }
+
+    /// Puts back a saved queue, `song` turning ids into songs. False (and nothing changed)
+    /// when a song of the playlist or the current one is gone, or the state doesn't add up.
+    pub fn restore(&mut self, state: QueueState, song: impl Fn(&str) -> Option<Track>) -> bool {
+        let Some(tracks) = state.tracks.iter().map(|id| song(id)).collect::<Option<Vec<Track>>>() else {
+            return false;
+        };
+        let current = match &state.current {
+            Some(id) => match song(id) {
+                Some(t) => Some(t),
+                None => return false,
+            },
+            None => None,
+        };
+        let n = tracks.len();
+        let fits =
+            state.order.iter().chain(&state.removed).all(|&i| i < n) && state.pos.is_none_or(|p| p < state.order.len());
+        if !fits {
+            return false;
+        }
+        self.tracks = tracks;
+        self.order = state.order;
+        self.pos = state.pos;
+        // Songs you queued that are gone are just left out.
+        self.up_next = state.up_next.iter().filter_map(|id| song(id)).collect();
+        self.current = current;
+        self.current_queued = state.current_queued;
+        self.removed = state.removed.into_iter().collect();
+        self.shuffle = state.shuffle;
+        self.repeat = state.repeat;
+        self.context_name = state.context_name;
+        true
+    }
+
+    /// The first song of the list playback started from.
+    pub fn context_first(&self) -> Option<&Track> {
+        self.tracks.first()
+    }
+
+    /// Every song the queue holds.
+    pub fn all_tracks(&self) -> impl Iterator<Item = &Track> {
+        self.tracks.iter().chain(&self.up_next).chain(&self.current)
+    }
+
     pub fn set_context(&mut self, tracks: Vec<Track>, start: usize, name: String) -> Option<Track> {
         self.tracks = tracks;
         self.context_name = name;
+        self.removed.clear();
+        self.current_queued = false;
         if self.tracks.is_empty() {
             self.order.clear();
             self.pos = None;
@@ -40,14 +123,17 @@ impl Queue {
     }
 
     fn build_order(&mut self, current: usize) {
-        self.order = (0..self.tracks.len()).collect();
+        let removed = &self.removed;
+        self.order = (0..self.tracks.len())
+            .filter(|i| *i == current || !removed.contains(i))
+            .collect();
         if self.shuffle {
             self.order.retain(|&i| i != current);
             self.order.shuffle(&mut rand::rng());
             self.order.insert(0, current);
             self.pos = Some(0);
         } else {
-            self.pos = Some(current);
+            self.pos = self.order.iter().position(|&i| i == current);
         }
     }
 
@@ -96,8 +182,10 @@ impl Queue {
         }
         if let Some(t) = self.up_next.pop_front() {
             self.current = Some(t);
+            self.current_queued = true;
             return self.current.clone();
         }
+        self.current_queued = false;
         let next = self.pos.map_or(0, |p| p + 1);
         if next < self.order.len() {
             self.pos = Some(next);
@@ -116,6 +204,14 @@ impl Queue {
     }
 
     pub fn previous(&mut self) -> Option<Track> {
+        // From a song you queued, back to the one that played before it.
+        if self.current_queued {
+            if let Some(i) = self.current_context_index() {
+                self.current_queued = false;
+                self.current = Some(self.tracks[i].clone());
+                return self.current.clone();
+            }
+        }
         match self.pos {
             Some(p) if p > 0 => self.pos = Some(p - 1),
             Some(_) if self.repeat == RepeatMode::All && !self.order.is_empty() => {
@@ -164,26 +260,47 @@ impl Queue {
         self.up_next.len()
     }
 
-    /// Jumps to entry `index` of `upcoming()`.
-    pub fn jump_to(&mut self, index: usize) -> Option<Track> {
+    /// Where song `id` is in `upcoming()`: at `index` if it's still there (the queue may have
+    /// moved on since it was shown), else its first entry.
+    fn find_upcoming(&self, index: usize, id: &str) -> Option<usize> {
+        let rest = self.pos.map_or(0, |p| p + 1);
+        let at = |i: usize| -> Option<&Track> {
+            if i < self.up_next.len() {
+                self.up_next.get(i)
+            } else {
+                self.order.get(rest + i - self.up_next.len()).map(|&t| &self.tracks[t])
+            }
+        };
+        if at(index).is_some_and(|t| t.id == id) {
+            return Some(index);
+        }
+        (0..self.up_next.len() + self.order.len().saturating_sub(rest)).find(|&i| at(i).is_some_and(|t| t.id == id))
+    }
+
+    /// Jumps to song `id` at entry `index` of `upcoming()`. Songs you queued stay queued when
+    /// jumping into the rest of the playlist.
+    pub fn jump_to(&mut self, index: usize, id: &str) -> Option<Track> {
+        let index = self.find_upcoming(index, id)?;
         if index < self.up_next.len() {
             self.up_next.drain(..index);
             return self.advance(true);
         }
-        let ctx_offset = index - self.up_next.len();
-        self.up_next.clear();
         let rest = self.pos.map_or(0, |p| p + 1);
-        let target = rest + ctx_offset;
+        let target = rest + index - self.up_next.len();
         if target >= self.order.len() {
             return None;
         }
         self.pos = Some(target);
+        self.current_queued = false;
         self.current = self.current_context_index().map(|i| self.tracks[i].clone());
         self.current.clone()
     }
 
-    /// Removes entry `index` of `upcoming()`.
-    pub fn remove(&mut self, index: usize) {
+    /// Removes song `id` at entry `index` of `upcoming()`.
+    pub fn remove(&mut self, index: usize, id: &str) {
+        let Some(index) = self.find_upcoming(index, id) else {
+            return;
+        };
         if index < self.up_next.len() {
             self.up_next.remove(index);
             return;
@@ -191,14 +308,16 @@ impl Queue {
         let rest = self.pos.map_or(0, |p| p + 1);
         let target = rest + index - self.up_next.len();
         if target < self.order.len() {
-            self.order.remove(target);
+            self.removed.insert(self.order.remove(target));
         }
     }
 
     pub fn clear_upcoming(&mut self) {
         self.up_next.clear();
         let keep = self.pos.map_or(0, |p| p + 1);
-        self.order.truncate(keep);
+        if keep < self.order.len() {
+            self.removed.extend(self.order.drain(keep..));
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -288,11 +407,93 @@ mod tests {
     }
 
     #[test]
+    fn saved_queue_comes_back_the_same() {
+        let all = tracks(10);
+        let mut q = Queue {
+            shuffle: true,
+            repeat: RepeatMode::All,
+            ..Default::default()
+        };
+        q.set_context(all[..6].to_vec(), 2, "Mix".into());
+        q.advance(false);
+        q.remove(0, &q.upcoming(1)[0].id.clone());
+        q.enqueue(vec![all[9].clone()]);
+        q.advance(false);
+
+        let saved = serde_json::to_string(&q.state()).unwrap();
+        let state: QueueState = serde_json::from_str(&saved).unwrap();
+        let find = |id: &str| all.iter().find(|t| t.id == id).cloned();
+        let mut back = Queue::default();
+        assert!(back.restore(state.clone(), find));
+        assert_eq!(back.state(), q.state());
+        assert_eq!(id(back.current().cloned()), "t9");
+        let ids = |q: &Queue| q.upcoming(20).into_iter().map(|t| t.id).collect::<Vec<_>>();
+        assert_eq!(ids(&back), ids(&q));
+
+        // A song of the playlist that is gone: not restored (the caller falls back).
+        let missing = |id: &str| (id != "t3").then(|| find(id)).flatten();
+        assert!(!Queue::default().restore(state.clone(), missing));
+        // Nonsense positions are refused rather than trusted.
+        let mut bad = state;
+        bad.order.push(99);
+        assert!(!Queue::default().restore(bad, find));
+    }
+
+    #[test]
     fn jump_and_remove() {
         let mut q = Queue::default();
         q.set_context(tracks(5), 0, String::new());
-        q.remove(0); // removes t1
-        assert_eq!(id(q.jump_to(1)), "t3");
+        q.remove(0, "t1");
+        assert_eq!(id(q.jump_to(1, "t3")), "t3");
+        assert_eq!(id(q.advance(false)), "t4");
+    }
+
+    #[test]
+    fn jump_and_remove_find_the_song_shown() {
+        let mut q = Queue::default();
+        q.set_context(tracks(5), 0, String::new());
+        // The list showed t2 at 1, but the queue has moved on one song since.
+        q.advance(false);
+        assert_eq!(id(q.jump_to(1, "t3")), "t3");
+        q.remove(5, "t4");
+        assert_eq!(q.upcoming(10).len(), 0);
+        // A song that isn't upcoming anymore does nothing.
+        assert!(q.jump_to(0, "t0").is_none());
+    }
+
+    #[test]
+    fn removed_songs_stay_removed_with_shuffle() {
+        let mut q = Queue::default();
+        q.set_context(tracks(6), 0, String::new());
+        q.remove(0, "t1");
+        q.remove(0, "t2");
+        q.set_shuffle(true);
+        q.set_shuffle(false);
+        let ids: Vec<String> = q.upcoming(10).into_iter().map(|t| t.id).collect();
+        assert_eq!(ids, ["t3", "t4", "t5"]);
+        q.clear_upcoming();
+        q.set_shuffle(true);
+        assert!(q.upcoming(10).is_empty());
+    }
+
+    #[test]
+    fn previous_from_a_queued_song_goes_back_one() {
+        let mut q = Queue::default();
+        q.set_context(tracks(5), 2, String::new());
+        q.enqueue(vec![tracks(9).remove(8)]);
+        assert_eq!(id(q.advance(true)), "t8");
+        assert_eq!(id(q.previous()), "t2");
+        assert_eq!(id(q.advance(false)), "t3");
+    }
+
+    #[test]
+    fn jumping_into_the_playlist_keeps_queued_songs() {
+        let mut q = Queue::default();
+        q.set_context(tracks(5), 0, String::new());
+        q.enqueue(vec![tracks(9).remove(8)]);
+        // Upcoming: t8 (queued), t1, t2, t3, t4.
+        assert_eq!(id(q.jump_to(3, "t3")), "t3");
+        assert_eq!(id(q.advance(false)), "t8");
         assert_eq!(id(q.advance(false)), "t4");
     }
 }

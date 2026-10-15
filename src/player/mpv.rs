@@ -26,6 +26,8 @@ pub enum MpvEvent {
     EndFile {
         reason: String,
         error: Option<String>,
+        /// The playlist entry that ended (see [`MpvEvent::StartFile`]).
+        playlist_entry_id: i64,
     },
     Pause(bool),
     Duration(f64),
@@ -531,6 +533,7 @@ fn parse_event(msg: &Value) -> Option<MpvEvent> {
         "end-file" => Some(MpvEvent::EndFile {
             reason: msg.get("reason").and_then(Value::as_str).unwrap_or("").to_string(),
             error: msg.get("file_error").and_then(Value::as_str).map(str::to_string),
+            playlist_entry_id: msg.get("playlist_entry_id").and_then(Value::as_i64).unwrap_or(0),
         }),
         "property-change" => match msg.get("name")?.as_str()? {
             "pause" => Some(MpvEvent::Pause(msg.get("data")?.as_bool()?)),
@@ -554,14 +557,16 @@ mod tests {
             ev(r#"{"event":"end-file","reason":"eof","playlist_entry_id":1}"#),
             Some(MpvEvent::EndFile {
                 reason: "eof".into(),
-                error: None
+                error: None,
+                playlist_entry_id: 1
             })
         );
         assert_eq!(
             ev(r#"{"event":"end-file","reason":"error","file_error":"unrecognized file format"}"#),
             Some(MpvEvent::EndFile {
                 reason: "error".into(),
-                error: Some("unrecognized file format".into())
+                error: Some("unrecognized file format".into()),
+                playlist_entry_id: 0
             })
         );
         assert_eq!(

@@ -232,7 +232,7 @@ fn shortcut_card(ui: &mut Ui, cx: &mut Cx, p: &Playlist, w: f32) {
     widgets::fade_fill(ui, resp.id, rect, RADIUS, resp.hovered(), HOVER);
     let art = Rect::from_min_size(rect.min + vec2(6.0, 6.0), vec2(52.0, 52.0));
     widgets::playlist_cover(ui, cx.art, p, art, 10);
-    let here = cx.player.context == p.name && cx.player.current.is_some();
+    let here = widgets::plays_from(cx, &p.name, |id| p.track_ids.iter().any(|t| t == id));
     let playing = here && cx.player.status == PlayStatus::Playing;
     text_trunc(
         ui,
@@ -505,6 +505,25 @@ fn play_list(cx: &mut Cx, tracks: &[&Track], shuffle: bool, context: &str) {
 // ------------------------------------------------------------------ list pages
 
 /// Case-insensitive filter over title/artist/album.
+/// When the list's filter leaves nothing, says so (the list isn't empty) with a way back.
+/// True when it did.
+fn no_matches(ui: &mut Ui, shown: usize, filter_text: &mut String) -> bool {
+    if shown > 0 || filter_text.trim().is_empty() {
+        return false;
+    }
+    panels::empty_state(
+        ui,
+        icon::MAGNIFYING_GLASS,
+        &format!("No songs match “{}”", filter_text.trim()),
+    );
+    ui.vertical_centered(|ui| {
+        if ui.button("Clear filter").clicked() {
+            filter_text.clear();
+        }
+    });
+    true
+}
+
 fn filter<'a>(tracks: Vec<&'a Track>, needle: &str) -> Vec<&'a Track> {
     let needle = needle.trim().to_lowercase();
     if needle.is_empty() {
@@ -523,6 +542,8 @@ fn filter<'a>(tracks: Vec<&'a Track>, needle: &str) -> Vec<&'a Track> {
 struct Header<'a> {
     /// "Playlist", "Album", "Artist"…
     kind: &'a str,
+    /// Playback started from this list (see [`widgets::plays_from`]).
+    playing_from: bool,
     title: &'a str,
     description: &'a str,
     meta: String,
@@ -624,7 +645,7 @@ fn list_header(
     let mut shuffle = false;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
-        let here = cx.player.context == h.title && cx.player.current.is_some();
+        let here = h.playing_from;
         let playing_here = here && cx.player.status == PlayStatus::Playing;
         let (glyph, label) = if playing_here {
             (egui_phosphor::fill::PAUSE, "Pause")
@@ -664,6 +685,7 @@ fn songs(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
         let total_ms: u64 = all.iter().map(|t| t.duration_ms).sum();
         let header = Header {
             kind: "Folder",
+            playing_from: widgets::plays_from(cx, "Local Files", |id| all.iter().any(|t| t.id == id)),
             title: "Local Files",
             description: "Every song in your music folders",
             meta: format!("{} songs, {}", all.len(), theme::fmt_total(total_ms)),
@@ -686,6 +708,9 @@ fn songs(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
         let tracks = filter(all, st.filter_text);
         if play || shuffle {
             play_list(cx, &tracks, shuffle, "Local Files");
+        }
+        if no_matches(ui, tracks.len(), st.filter_text) {
+            return;
         }
         if tracks.is_empty() {
             panels::empty_state(ui, icon::FOLDER, "No local songs yet — add a music folder in Settings");
@@ -818,6 +843,7 @@ fn album(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, key: &str) {
         let total_ms: u64 = all.iter().map(|t| t.duration_ms).sum();
         let header = Header {
             kind: "Album",
+            playing_from: widgets::plays_from(cx, &a.name, |id| all.iter().any(|t| t.id == id)),
             title: &a.name,
             description: "",
             meta: format!("{} • {} songs, {}", a.artist, all.len(), theme::fmt_total(total_ms)),
@@ -852,6 +878,9 @@ fn album(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, key: &str) {
         if play || shuffle {
             play_list(cx, &tracks, shuffle, &a.name);
         }
+        if no_matches(ui, tracks.len(), st.filter_text) {
+            return;
+        }
         let opts = TableOpts {
             id: "album",
             context: &a.name,
@@ -881,6 +910,7 @@ fn playlist(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, id: &str) {
         let total_ms: u64 = all.iter().map(|t| t.duration_ms).sum();
         let header = Header {
             kind: if p.kind.is_album() { "Album" } else { "Playlist" },
+            playing_from: widgets::plays_from(cx, &p.name, |id| all.iter().any(|t| t.id == id)),
             title: &p.name,
             description: &p.description,
             meta: format!("{} songs, {}", all.len(), theme::fmt_total(total_ms)),
@@ -915,6 +945,9 @@ fn playlist(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, id: &str) {
                     .color(TEXT_FAINT),
             );
             ui.add_space(4.0);
+        }
+        if no_matches(ui, tracks.len(), st.filter_text) {
+            return;
         }
         if tracks.is_empty() {
             let msg = if p.kind == PlaylistKind::Liked {
@@ -1025,6 +1058,7 @@ fn library_artist(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, key: &str) {
         let total_ms: u64 = all.iter().map(|t| t.duration_ms).sum();
         let header = Header {
             kind: "Artist",
+            playing_from: widgets::plays_from(cx, &a.name, |id| all.iter().any(|t| t.id == id)),
             title: &a.name,
             description: "",
             meta: format!("{} songs in your library, {}", all.len(), theme::fmt_total(total_ms)),
@@ -1065,7 +1099,10 @@ fn library_artist(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, key: &str) {
             show_album: true,
             show_header: true,
         };
-        widgets::track_table(ui, cx, &tracks, &opts, viewport, origin);
+        // Their songs elsewhere (below) may still match the filter.
+        if !no_matches(ui, tracks.len(), st.filter_text) {
+            widgets::track_table(ui, cx, &tracks, &opts, viewport, origin);
+        }
 
         // Their songs on Spotify and SoundCloud that aren't in the library (asked for by the
         // app as the page `artist:<name>`).
@@ -1182,6 +1219,7 @@ fn remote_page(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, key: &str) {
         }
         let header = Header {
             kind: &p.kind,
+            playing_from: widgets::plays_from(cx, &p.title, |id| p.tracks.iter().any(|t| t.id == id)),
             title: &p.title,
             description: "",
             meta,
@@ -1272,6 +1310,9 @@ fn remote_page(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, key: &str) {
                     .color(TEXT_FAINT),
             );
             ui.add_space(4.0);
+        }
+        if no_matches(ui, tracks.len(), st.filter_text) {
+            return;
         }
         if tracks.is_empty() {
             panels::empty_state(ui, icon::MUSIC_NOTES, "No playable songs here");

@@ -21,15 +21,42 @@ on:
 permissions:
   contents: read
 
+# A newer push waits for a running release instead of stopping it halfway through uploading.
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A version is published once: pushes that don't change the version build nothing, and
+  # never replace the files of a release people already update from.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      publish: ${{ steps.check.outputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::notice::v$VERSION is already published; bump the version to release again"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
   windows:
+    needs: version
+    if: needs.version.outputs.publish == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -189,6 +216,8 @@ jobs:
           if-no-files-found: error
 
   macos:
+    needs: version
+    if: needs.version.outputs.publish == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -329,6 +358,8 @@ jobs:
           if-no-files-found: error
 
   arch:
+    needs: version
+    if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
@@ -371,9 +402,9 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [windows, macos, arch]
-    # A problem with the Linux package doesn't hold back the Windows and macOS versions.
-    if: ${{ !cancelled() && needs.windows.result == 'success' && needs.macos.result == 'success' }}
+    needs: [version, windows, macos, arch]
+    # The Arch job runs the tests (the PKGBUILD's check()): nothing is published when they fail.
+    if: ${{ !cancelled() && needs.windows.result == 'success' && needs.macos.result == 'success' && needs.arch.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -415,9 +446,7 @@ jobs:
 
           Sumo checks for updates by itself and installs them with one click. Sumo was called MultiMusic until 0.4: the \`MultiMusic-…\` files are the same installers under the old name, for older versions to update from.
           EOF
-          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "v$VERSION" ./* --clobber --repo "$GITHUB_REPOSITORY"
-          else
-            gh release create "v$VERSION" ./* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-              --title "Sumo $VERSION" --notes-file ../notes.md
-          fi
+          # Never replaces the files of a published release (this fails if one appeared since
+          # the version check).
+          gh release create "v$VERSION" ./* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Sumo $VERSION" --notes-file ../notes.md

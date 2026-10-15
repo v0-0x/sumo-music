@@ -517,8 +517,21 @@ pub fn grid(ui: &mut Ui, count: usize, min_w: f32, mut draw: impl FnMut(&mut Ui,
     let cols = (((avail + gap) / (min_w + gap)).floor() as usize).max(1);
     let w = ((avail - gap * (cols as f32 - 1.0)) / cols as f32).floor();
     let mut i = 0;
+    // Rows are the same height: once one is drawn, rows that are scrolled out of view only take
+    // their space. Drawing them would load every cover in a big library each frame, more than
+    // the art cache holds, so covers would be dropped and loaded again forever.
+    let mut row_h: Option<f32> = None;
     while i < count {
-        ui.horizontal(|ui| {
+        if let Some(h) = row_h {
+            let row = Rect::from_min_size(ui.cursor().min, vec2(avail, h));
+            if !ui.is_rect_visible(row) {
+                ui.add_space(h + ui.spacing().item_spacing.y);
+                i += cols;
+                ui.add_space(14.0);
+                continue;
+            }
+        }
+        let drawn = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
             for _ in 0..cols {
                 if i >= count {
@@ -528,8 +541,21 @@ pub fn grid(ui: &mut Ui, count: usize, min_w: f32, mut draw: impl FnMut(&mut Ui,
                 i += 1;
             }
         });
+        row_h.get_or_insert(drawn.response.rect.height());
         ui.add_space(14.0);
     }
+}
+
+/// Whether playback started from this list (`name`; `has` tells whether a song is in it).
+/// Lists can share a name, so the playing song (or, while a song you queued plays, the first
+/// song of the list it started from) must be in it too.
+pub fn plays_from(cx: &Cx, name: &str, has: impl Fn(&str) -> bool) -> bool {
+    let Some(current) = &cx.player.current else {
+        return false;
+    };
+    !cx.player.context.is_empty()
+        && cx.player.context == name
+        && (has(&current.id) || cx.player.context_first.as_deref().is_some_and(&has))
 }
 
 /// Options for [`track_table`].

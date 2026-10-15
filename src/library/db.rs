@@ -215,6 +215,19 @@ impl Db {
         Ok(())
     }
 
+    /// Stores the order of the playlists (`ids` first to last), without touching their songs.
+    pub fn set_playlist_order(&mut self, ids: &[String]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE playlists SET position = ?1 WHERE id = ?2")?;
+            for (i, id) in ids.iter().enumerate() {
+                stmt.execute(params![i as i64, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn delete_playlist(&mut self, id: &str) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?1", [id])?;
@@ -337,6 +350,19 @@ mod tests {
         };
         db.save_playlist(&p, 0).unwrap();
         assert_eq!(db.load_playlists().unwrap(), vec![p.clone()]);
+
+        // The order can change without rewriting the songs.
+        let q = Playlist {
+            id: "custom:2".into(),
+            name: "Second".into(),
+            ..p.clone()
+        };
+        db.save_playlist(&q, 1).unwrap();
+        db.set_playlist_order(&["custom:2".into(), "custom:1".into()]).unwrap();
+        let order: Vec<String> = db.load_playlists().unwrap().into_iter().map(|p| p.id).collect();
+        assert_eq!(order, ["custom:2", "custom:1"]);
+        assert_eq!(db.load_playlists().unwrap()[1].track_ids, p.track_ids);
+        db.delete_playlist("custom:2").unwrap();
 
         // Orphan pruning keeps referenced and local tracks.
         db.upsert_tracks(&[track("soundcloud:9", Source::SoundCloud)], &HashMap::new())

@@ -339,7 +339,7 @@ fn playlist_row(ui: &mut Ui, cx: &mut Cx, p: &crate::model::Playlist, view: &Vie
         Rect::from_min_size(Pos2::new(rect.left() + 6.0, rect.center().y - 15.0), vec2(30.0, 30.0))
     };
     widgets::playlist_cover(ui, cx.art, p, art, 7);
-    let here = !cx.player.context.is_empty() && cx.player.context == p.name && cx.player.current.is_some();
+    let here = widgets::plays_from(cx, &p.name, |id| p.track_ids.iter().any(|t| t == id));
     let playing = here && cx.player.status == PlayStatus::Playing;
     if !collapsed {
         let x = art.right() + 10.0;
@@ -1265,6 +1265,10 @@ pub fn lyrics(ui: &mut Ui, cx: &mut Cx, big: bool) {
         return;
     };
     let state = &cx.feed.lyrics;
+    if state.track_id == t.id && state.off {
+        empty_state(ui, icon::MICROPHONE_STAGE, "Lyrics are turned off in Settings");
+        return;
+    }
     if state.track_id != t.id || state.loading {
         ui.add_space(20.0);
         ui.horizontal(|ui| {
@@ -1544,9 +1548,9 @@ fn queue_row(ui: &mut Ui, cx: &mut Cx, t: &crate::model::Track, index: Option<us
             );
         }
         if xr.clicked() {
-            cx.actions.push(Action::Cmd(Command::RemoveUpcoming(i)));
+            cx.actions.push(Action::Cmd(Command::RemoveUpcoming(i, t.id.clone())));
         } else if resp.double_clicked() || resp.clicked() {
-            cx.actions.push(Action::Cmd(Command::JumpTo(i)));
+            cx.actions.push(Action::Cmd(Command::JumpTo(i, t.id.clone())));
         }
     }
     let track = t.clone();

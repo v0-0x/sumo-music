@@ -116,6 +116,14 @@ fn run(rx: mpsc::Receiver<Msg>) {
                     app_id: id,
                     song_as_name: s,
                 } => {
+                    // As above: turning it off (or another app) clears what Discord shows.
+                    if id != app_id || !e {
+                        if let Some(mut c) = client.take() {
+                            let _ = c.clear_activity();
+                            let _ = c.close();
+                        }
+                        last_connect_try = None;
+                    }
                     enabled = e;
                     app_id = id;
                     song_as_name = s;
