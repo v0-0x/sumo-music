@@ -471,7 +471,8 @@ mod tests {
 
     #[test]
     fn scan_finds_new_and_removed_files() {
-        let dir = std::env::temp_dir().join(format!("multimusic-scan-test-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let album = dir.join("Artist").join("Album");
         std::fs::create_dir_all(&album).unwrap();
         std::fs::write(album.join("01 Song.mp3"), b"not really audio").unwrap();
@@ -592,7 +593,8 @@ mod tests {
 
     #[test]
     fn tags_win_over_the_file_name() {
-        let dir = std::env::temp_dir().join(format!("multimusic-names-test-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let folder = dir.join("Folder Artist").join("Folder Album");
         std::fs::create_dir_all(&folder).unwrap();
         let path = folder.join("05 - Name Artist - Name Title.wav");

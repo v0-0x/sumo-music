@@ -96,8 +96,11 @@ jobs:
           $rel = gh api repos/shinchiro/mpv-winbuild-cmake/releases/latest | ConvertFrom-Json
           $asset = $rel.assets | Where-Object { $_.name -match '^mpv-x86_64-\d{8}-git-[0-9a-f]+\.7z$' } | Select-Object -First 1
           if (-not $asset) { $rel.assets | ForEach-Object { $_.name }; throw "no mpv build found" }
-          Write-Host "mpv: $($asset.name)"
+          Write-Host "mpv: $($asset.name) $($asset.digest)"
           Invoke-WebRequest $asset.browser_download_url -OutFile "dl\mpv.7z"
+          # GitHub records the SHA-256 of every upload: the file must be the one uploaded.
+          if ($asset.digest -notmatch '^sha256:([0-9a-f]{64})$') { throw "GitHub has no checksum for $($asset.name)" }
+          Assert-Hash dl\mpv.7z $Matches[1]
           7z x dl\mpv.7z -odl\mpv -y | Out-Null
           Copy-Item dl\mpv\mpv.exe stage\tools\
           Get-ChildItem dl\mpv -Filter *.dll | Copy-Item -Destination stage\tools\
@@ -110,6 +113,10 @@ jobs:
 
           # ffmpeg and ffprobe (LGPL, sharing their DLLs).
           Invoke-WebRequest https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip -OutFile dl\ffmpeg.zip
+          Invoke-WebRequest https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/checksums.sha256 -OutFile dl\ffmpeg.sums
+          $line = Get-Content dl\ffmpeg.sums | Where-Object { $_ -match '\s+ffmpeg-master-latest-win64-lgpl-shared\.zip$' } | Select-Object -First 1
+          if (-not $line) { throw "BtbN has no checksum for the ffmpeg build" }
+          Assert-Hash dl\ffmpeg.zip ($line -split '\s+')[0]
           Expand-Archive dl\ffmpeg.zip dl\ffmpeg
           $bin = Get-ChildItem dl\ffmpeg -Recurse -Directory -Filter bin | Select-Object -First 1
           Copy-Item "$($bin.FullName)\ffmpeg.exe", "$($bin.FullName)\ffprobe.exe" stage\tools\
@@ -194,6 +201,12 @@ jobs:
           $mesa = gh api repos/pal1000/mesa-dist-win/releases/latest | ConvertFrom-Json
           $m = $mesa.assets | Where-Object { $_.name -match 'release-msvc\.7z$' } | Select-Object -First 1
           Invoke-WebRequest $m.browser_download_url -OutFile dl\mesa.7z
+          if ($m.digest -match '^sha256:([0-9a-f]{64})$') {
+            $got = (Get-FileHash dl\mesa.7z -Algorithm SHA256).Hash.ToLower()
+            if ($got -ne $Matches[1]) { throw "checksum mismatch for $($m.name): $got" }
+          } else {
+            Write-Warning "GitHub has no checksum for $($m.name)"
+          }
           7z x dl\mesa.7z -odl\mesa -y | Out-Null
           Copy-Item dl\mesa\x64\*.dll $dir
           Start-Process $app
@@ -424,28 +437,30 @@ jobs:
         run: |
           set -euo pipefail
           VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          # What's new: the release commit's message without its title and trailers; lines that
+          # aren't list items become headings.
+          git log -1 --format=%B "$GITHUB_SHA" | tail -n +3 \
+            | sed -e '/^Co-Authored-By:/d' -e '/^Claude-Session:/d' \
+            | sed -e 's/</\&lt;/g' \
+            | awk 'NF && !/^[-[:space:]]/ { print "### " $0; next } { print }' > changes.md
           cd dist
-          # The same installers under the old name, which MultiMusic 0.3 and older look for when they
-          # update (the app was renamed Sumo in 0.4).
-          if [ -f "Sumo-Setup-$VERSION-x64.exe" ]; then
-            cp "Sumo-Setup-$VERSION-x64.exe" "MultiMusic-Setup-$VERSION-x64.exe"
-          fi
-          for arch in arm64 intel; do
-            if [ -f "Sumo-$VERSION-macos-$arch.zip" ]; then
-              cp "Sumo-$VERSION-macos-$arch.zip" "MultiMusic-$VERSION-macos-$arch.zip"
-            fi
-          done
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
-          cat > ../notes.md <<EOF
+          cat > ../install.md <<EOF
           ## Install
 
           - **Windows 10/11:** run \`Sumo-Setup-$VERSION-x64.exe\`. It installs for your user (no administrator prompt) with everything Sumo needs (mpv, yt-dlp, ffmpeg).
           - **macOS 11+:** open the \`.dmg\` for your Mac (**arm64** for Apple Silicon M1/M2/M3/M4, **intel** for Intel Macs) and drag Sumo to Applications. The app isn't notarized by Apple, so the first time: right-click Sumo → Open → Open (or System Settings → Privacy & Security → Open Anyway).
           - **Arch Linux (x86_64):** \`sudo pacman -U multimusic-*-x86_64.pkg.tar.zst\`, or build from the repository with \`makepkg -si\`.
 
-          Sumo checks for updates by itself and installs them with one click. Sumo was called MultiMusic until 0.4: the \`MultiMusic-…\` files are the same installers under the old name, for older versions to update from.
+          Sumo checks for updates by itself and installs them with one click.
           EOF
+          if [ -s ../changes.md ]; then
+            { echo "## What's new"; echo; cat ../changes.md; echo; cat ../install.md; } > ../notes.md
+          else
+            cp ../install.md ../notes.md
+          fi
+          cat ../notes.md
           # Never replaces the files of a published release (this fails if one appeared since
           # the version check).
           gh release create "v$VERSION" ./* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \

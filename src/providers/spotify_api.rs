@@ -1021,7 +1021,7 @@ pub fn parse_rfc3339(s: &str) -> Option<i64> {
             sign * (h * 3600 + m * 60)
         }
     };
-    let days = days_from_civil(year, month, day);
+    let days = crate::clock::days_from_civil(year, month as u32, day as u32);
     Some(days * 86_400 + hour * 3600 + minute * 60 + second - offset)
 }
 
@@ -1036,17 +1036,6 @@ fn days_in_month(y: i64, m: i64) -> i64 {
         4 | 6 | 9 | 11 => 30,
         _ => 31,
     }
-}
-
-/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12; // March = 0
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }
 
 #[cfg(test)]

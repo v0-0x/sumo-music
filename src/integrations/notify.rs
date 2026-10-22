@@ -5,12 +5,10 @@
 #[cfg(not(any(windows, target_os = "macos")))]
 pub fn song(title: &str, artist: &str, album: &str) {
     use std::collections::HashMap;
-    use std::sync::Mutex;
-
     use zbus::zvariant::Value;
 
     /// The connection and the id of the notification shown last.
-    static LAST: Mutex<Option<(zbus::blocking::Connection, u32)>> = Mutex::new(None);
+    static LAST: tokio::sync::Mutex<Option<(zbus::Connection, u32)>> = tokio::sync::Mutex::const_new(None);
 
     let summary = title.to_string();
     let body = escape(
@@ -21,11 +19,11 @@ pub fn song(title: &str, artist: &str, album: &str) {
             .collect::<Vec<_>>()
             .join(" — "),
     );
-    std::thread::spawn(move || {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    tokio::spawn(async move {
+        let mut last = LAST.lock().await;
         let conn = match last.as_ref() {
             Some((conn, _)) => conn.clone(),
-            None => match zbus::blocking::Connection::session() {
+            None => match zbus::Connection::session().await {
                 Ok(conn) => conn,
                 Err(e) => {
                     tracing::debug!("no session bus for notifications: {e}");
@@ -52,7 +50,8 @@ pub fn song(title: &str, artist: &str, album: &str) {
                     5000i32,
                 ),
             )
-            .and_then(|reply| reply.body::<u32>());
+            .await
+            .and_then(|reply| reply.body().deserialize::<u32>());
         match sent {
             Ok(id) => *last = Some((conn, id)),
             Err(e) => tracing::debug!("notification not shown: {e}"),

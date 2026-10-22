@@ -736,7 +736,7 @@ fn parse_iso8601(s: &str) -> Option<i64> {
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
-    let mut secs = days_from_civil(year, month, day) * 86_400;
+    let mut secs = crate::clock::days_from_civil(year, month, day) * 86_400;
 
     if let Some(time) = time {
         let (clock, offset) = if let Some(clock) = time.strip_suffix(['Z', 'z']) {
@@ -773,18 +773,6 @@ fn parse_utc_offset(s: &str) -> Option<i64> {
     let h: i64 = digits[..2].parse().ok()?;
     let m: i64 = digits.get(2..4).map_or(Some(0), |m| m.parse().ok())?;
     Some(sign * (h * 3600 + m * 60))
-}
-
-/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm).
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let (month, day) = (i64::from(month), i64::from(day));
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12; // March = 0
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }
 
 // ---------------------------------------------------------------------------------------------

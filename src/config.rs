@@ -584,7 +584,8 @@ mod tests {
 
     #[test]
     fn migrates_old_directory_once() {
-        let base = std::env::temp_dir().join(format!("multimusic-migrate-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
         let old = base.join("medley");
         let new = base.join("multimusic");
         std::fs::create_dir_all(&old).unwrap();

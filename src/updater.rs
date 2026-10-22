@@ -604,7 +604,8 @@ mod tests {
 
     #[test]
     fn checksums() {
-        let dir = std::env::temp_dir().join(format!("multimusic-sums-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("app.zip");
         std::fs::write(&file, b"hello").unwrap();
@@ -619,7 +620,8 @@ mod tests {
 
     #[test]
     fn downloads_get_a_private_folder() {
-        let base = std::env::temp_dir().join(format!("multimusic-update-test-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("update-test");
         let _ = std::fs::remove_dir_all(&base);
         let dir = fresh_download_dir(&base).unwrap();
         std::fs::write(dir.join("left-over"), b"x").unwrap();

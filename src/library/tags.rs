@@ -368,7 +368,8 @@ mod tests {
 
     #[test]
     fn writes_full_metadata_and_cover() {
-        let path = std::env::temp_dir().join(format!("multimusic-tags-{}.wav", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tags.wav");
         std::fs::write(&path, wav()).unwrap();
         let cover = [&[0xFF, 0xD8, 0xFF, 0xE0][..], &[0u8; 32]].concat();
         let meta = Metadata {
@@ -438,7 +439,8 @@ mod tests {
 
     #[test]
     fn editing_changes_only_what_is_asked() {
-        let path = std::env::temp_dir().join(format!("multimusic-edit-{}.wav", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("edit.wav");
         std::fs::write(&path, wav()).unwrap();
         let start = Metadata {
             title: "Song".into(),

@@ -87,7 +87,16 @@ mod system {
     }
 
     fn portal(title: &str, pick: Pick) -> anyhow::Result<Option<PathBuf>> {
-        let conn = zbus::blocking::Connection::session()?;
+        // This thread waits for the answer; a small runtime of its own carries the D-Bus talk.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(ask_portal(title, pick))
+    }
+
+    async fn ask_portal(title: &str, pick: Pick) -> anyhow::Result<Option<PathBuf>> {
+        use futures_util::StreamExt;
+        let conn = zbus::Connection::session().await?;
         // The portal answers on a request object whose path we know beforehand, so the
         // answer can't come before we listen for it.
         let token = format!("sumo{}", rand::random::<u32>());
@@ -97,13 +106,14 @@ mod system {
             .trim_start_matches(':')
             .replace('.', "_");
         let path = format!("/org/freedesktop/portal/desktop/request/{sender}/{token}");
-        let request = zbus::blocking::Proxy::new(
+        let request = zbus::Proxy::new(
             &conn,
             "org.freedesktop.portal.Desktop",
             path.as_str(),
             "org.freedesktop.portal.Request",
-        )?;
-        let mut answers = request.receive_signal("Response")?;
+        )
+        .await?;
+        let mut answers = request.receive_signal("Response").await?;
 
         let mut options: HashMap<&str, Value> = HashMap::new();
         options.insert("handle_token", Value::from(token.as_str()));
@@ -117,24 +127,28 @@ mod system {
                 options.insert("filters", Value::from(vec![(what.to_string(), patterns)]));
             }
         }
-        let chooser = zbus::blocking::Proxy::new(
+        let chooser = zbus::Proxy::new(
             &conn,
             "org.freedesktop.portal.Desktop",
             "/org/freedesktop/portal/desktop",
             "org.freedesktop.portal.FileChooser",
-        )?;
-        let _: zbus::zvariant::OwnedObjectPath = chooser.call("OpenFile", &("", title, options))?;
+        )
+        .await?;
+        let _: zbus::zvariant::OwnedObjectPath = chooser.call("OpenFile", &("", title, options)).await?;
 
-        let answer = answers.next().ok_or_else(|| anyhow!("the portal didn't answer"))?;
-        let (code, results): (u32, HashMap<String, OwnedValue>) = answer.body()?;
+        let answer = answers
+            .next()
+            .await
+            .ok_or_else(|| anyhow!("the portal didn't answer"))?;
+        let (code, results): (u32, HashMap<String, OwnedValue>) = answer.body().deserialize()?;
         // 1 is cancelled, 2 is closed some other way.
         if code != 0 {
             return Ok(None);
         }
         let uris: Vec<String> = results
             .get("uris")
-            .cloned()
             .ok_or_else(|| anyhow!("the portal sent no file"))?
+            .try_clone()?
             .try_into()
             .context("reading the portal's answer")?;
         Ok(uris.first().and_then(|uri| file_path(uri)))

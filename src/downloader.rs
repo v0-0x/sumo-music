@@ -237,10 +237,9 @@ pub fn basic_metadata(track: &Track) -> Metadata {
     }
 }
 
-/// Cover art; at most a few MB.
+/// Cover art, if it can be had.
 async fn fetch_image(http: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
-    let resp = http.get(url).send().await.ok()?.error_for_status().ok()?;
-    crate::http::read_capped(resp, 8 << 20).await.ok()
+    crate::http::get_image(http, url).await.ok()
 }
 
 /// Fragmented MP4 (SoundCloud's AAC streams) can't take tags; ffmpeg rewrites it as a regular
@@ -352,7 +351,8 @@ mod tests {
 
     #[tokio::test]
     async fn fragmented_mp4_is_detected() {
-        let dir = std::env::temp_dir().join(format!("multimusic-mp4-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         let mp4 = |boxes: &[(&[u8; 4], u32)]| {
             let mut out = Vec::new();
@@ -380,7 +380,8 @@ mod tests {
     /// Needs ffmpeg, which mpv depends on.
     #[tokio::test]
     async fn fragmented_aac_gets_tags() {
-        let dir = std::env::temp_dir().join(format!("multimusic-aac-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("song.m4a");
         let made = std::process::Command::new("ffmpeg")

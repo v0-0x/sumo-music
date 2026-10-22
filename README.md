@@ -63,7 +63,7 @@ cd sumo-music
 makepkg -si          # builds and installs the `multimusic` package
 ```
 
-Then launch **Sumo** from your app launcher, or run `sumo`.
+Then launch **Sumo** from your app launcher, or run `sumo`. The `PKGBUILD` also works on its own (in a clean chroot with `extra-x86_64-build`, or with an AUR helper): outside the repository it builds the release tagged `v<version>`.
 
 **Updates:** when a new version is out, Sumo shows a bar with **Update now**. It downloads the release's ready-made package (built by GitHub Actions for x86_64), checks its SHA-256 checksum, asks for your password and installs it with `sudo pacman -U`, then starts again. To update by hand instead:
 

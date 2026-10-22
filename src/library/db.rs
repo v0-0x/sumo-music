@@ -291,6 +291,15 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Keeps the newest `keep` plays (the history only grows otherwise). Returns how many
+    /// were dropped.
+    pub fn trim_plays(&self, keep: usize) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM plays WHERE rowid NOT IN (SELECT rowid FROM plays ORDER BY played_at DESC LIMIT ?1)",
+            [keep as i64],
+        )?)
+    }
+
     pub fn get_kv(&self, key: &str) -> Option<String> {
         self.conn
             .query_row("SELECT value FROM kv WHERE key = ?1", [key], |r| r.get(0))
@@ -359,7 +368,8 @@ mod tests {
     /// An older database gets the new columns once; album artist and disc come back.
     #[test]
     fn old_databases_are_updated() {
-        let dir = std::env::temp_dir().join(format!("multimusic-db-migrate-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("library.db");
@@ -446,6 +456,8 @@ mod tests {
         assert_eq!(db.recent_plays(10).unwrap(), vec!["a".to_string(), "b".to_string()]);
         // Played once isn't "most played" yet.
         assert_eq!(db.top_plays(10).unwrap(), vec!["a".to_string()]);
+        assert_eq!(db.trim_plays(2).unwrap(), 1);
+        assert_eq!(db.recent_plays(10).unwrap(), vec!["a".to_string(), "b".to_string()]);
         db.set_kv("k", "v").unwrap();
         assert_eq!(db.get_kv("k").as_deref(), Some("v"));
         db.set_kv("download:soundcloud:1", "/a.mp3").unwrap();

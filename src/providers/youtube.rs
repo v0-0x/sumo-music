@@ -630,7 +630,8 @@ mod tests {
 
     #[tokio::test]
     async fn runs_ytdlp() {
-        let dir = std::env::temp_dir().join(format!("multimusic-ytdlp-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
 

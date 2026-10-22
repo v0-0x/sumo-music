@@ -610,7 +610,8 @@ mod tests {
         if std::process::Command::new("mpv").arg("--version").output().is_err() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("multimusic-mpv-test-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         let wav = dir.join("tone.wav");
         write_test_wav(&wav, 2.0);
@@ -664,7 +665,8 @@ mod tests {
         assert!(is_private_dir(&ipc_dir()), "{}", ipc_dir().display());
         assert!(ipc_path(3).starts_with(ipc_dir()));
         assert!(ipc_path(3).as_os_str().len() <= 104);
-        let dir = std::env::temp_dir().join(format!("multimusic-private-test-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("private-test");
         let _ = std::fs::remove_dir_all(&dir);
         assert!(private_dir(&dir));
         assert!(private_dir(&dir));
@@ -687,7 +689,8 @@ mod tests {
         if std::process::Command::new("mpv").arg("--version").output().is_err() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("multimusic-mpv-levels-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         let wav = dir.join("tone.wav");
         write_test_wav(&wav, 1.0);

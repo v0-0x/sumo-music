@@ -107,7 +107,7 @@ pub fn thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -541,7 +541,7 @@ fn chart(ui: &mut Ui, accent: Color32, bars: &[Bucket], per: &str) {
             color,
         );
         let every = if n > 12 { 5 } else { 1 };
-        if (n - 1 - i) % every == 0 || over {
+        if (n - 1 - i).is_multiple_of(every) || over {
             p.text(
                 Pos2::new(x, plot.bottom() + 8.0),
                 Align2::CENTER_TOP,

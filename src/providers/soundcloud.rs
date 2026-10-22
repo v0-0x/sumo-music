@@ -1331,7 +1331,6 @@ pub fn file_stem(artist: &str, title: &str) -> String {
     }
 }
 
-/// `dir/stem.ext`, or `dir/stem (2).ext` and so on if that exists.
 /// Moves a finished file to the first free "stem.ext" / "stem (2).ext" … in `dir`. The name is
 /// claimed by creating it, so two downloads finishing at once never take the same one.
 pub fn save_unique(file: &Path, dir: &Path, stem: &str, ext: &str) -> std::io::Result<PathBuf> {
@@ -1525,18 +1524,7 @@ fn parse_timestamp(s: &str) -> Option<i64> {
     if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
         return None;
     }
-    Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec)
-}
-
-/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
+    Some(crate::clock::days_from_civil(y, mo as u32, d as u32) * 86_400 + h * 3600 + mi * 60 + sec)
 }
 
 #[cfg(test)]
@@ -2092,7 +2080,9 @@ mod tests {
         assert_eq!(file_stem("", "COM1.final"), "_COM1.final");
         assert_eq!(file_stem("", "Console"), "Console");
 
-        let dir = std::env::temp_dir().join(format!("multimusic-names-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         let part = |name: &str, data: &[u8]| {
             let p = dir.join(name);
@@ -2163,7 +2153,8 @@ mod tests {
         let (base, seen) = media_server().await;
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
         let sc = SoundCloud::new(http, "testid", "");
-        let dir = std::env::temp_dir().join(format!("multimusic-dl-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         let part = dir.join(".part");
         let progress = std::sync::Mutex::new(Vec::new());

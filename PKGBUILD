@@ -1,9 +1,10 @@
 # Maintainer: v0-0x
-# Builds Sumo from this checkout:  makepkg -si
+# In the repository, `makepkg -si` builds this checkout. Anywhere else (a clean chroot, an AUR
+# helper, a copy of just this file) it builds the release tagged v$pkgver.
 pkgname=multimusic
 # The same as `version` in Cargo.toml (a test checks). A fixed version, not a pkgver() function:
 # makepkg writes what pkgver() returns into this file, which then blocks `git pull`.
-pkgver=0.6.0
+pkgver=0.6.1
 pkgrel=1
 pkgdesc="Sumo: lightweight native music player for local files, Spotify and SoundCloud with synced lyrics, Discord Rich Presence and Last.fm scrobbling"
 arch=('x86_64' 'aarch64')
@@ -24,9 +25,22 @@ conflicts=('medley')
 replaces=('medley')
 options=('!lto' '!debug')
 
+# makepkg sets startdir to the folder holding this file before reading it.
+if [[ -f "${startdir:-.}/Cargo.toml" ]]; then
+  source=()
+  sha256sums=()
+else
+  makedepends+=('git')
+  source=("sumo-music::git+$url.git#tag=v$pkgver")
+  sha256sums=('SKIP')
+fi
+
 _root() {
-  # The PKGBUILD lives in the repository root.
-  printf '%s' "$startdir"
+  if [[ -f "$startdir/Cargo.toml" ]]; then
+    printf '%s' "$startdir"
+  else
+    printf '%s' "$srcdir/sumo-music"
+  fi
 }
 
 prepare() {

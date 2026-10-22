@@ -4,6 +4,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod backup;
+mod cache;
 mod clock;
 mod config;
 mod downloader;

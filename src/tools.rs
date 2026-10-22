@@ -121,7 +121,7 @@ pub fn end_with_us(child: &tokio::process::Child) {
         });
         if let (true, Some(handle)) = (job != 0, child.raw_handle()) {
             unsafe {
-                AssignProcessToJobObject(job as *mut std::ffi::c_void, handle as *mut std::ffi::c_void);
+                AssignProcessToJobObject(job as *mut std::ffi::c_void, handle);
             }
         }
     }
