@@ -132,6 +132,8 @@ mod tests {
         let dir = std::env::temp_dir();
         let file = dir.join(format!("multimusic-test-{}.m3u", std::process::id()));
         let t = Track {
+            album_artist: String::new(),
+            disc_no: None,
             id: "local:/x/y.flac".into(),
             source: Source::Local,
             title: "Y".into(),

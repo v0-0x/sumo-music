@@ -320,6 +320,11 @@ pub struct UiConfig {
     pub art_cache_size: usize,
     /// The periods picked on the Last.fm profile page.
     pub profile: ProfilePrefs,
+    /// The window's size when last closed (not maximized), in screen points.
+    pub window_size: Option<[f32; 2]>,
+    pub maximized: bool,
+    /// A desktop notification when a new song starts.
+    pub notifications: bool,
 }
 
 /// What each part of the Last.fm profile page shows.
@@ -346,6 +351,9 @@ impl Default for UiConfig {
             right_panel_width: 352.0,
             art_cache_size: 200,
             profile: ProfilePrefs::default(),
+            window_size: None,
+            maximized: false,
+            notifications: false,
         }
     }
 }

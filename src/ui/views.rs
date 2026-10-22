@@ -160,6 +160,45 @@ fn home(ui: &mut Ui, cx: &mut Cx) {
             ui.add_space(10.0);
         }
 
+        // Most played (twice or more), one row.
+        let top: Vec<&Track> = cx
+            .lib
+            .most_played
+            .iter()
+            .filter_map(|id| cx.lib.get(id))
+            .take(tiles_per_row(ui, 160.0))
+            .collect();
+        if top.len() >= 3 {
+            widgets::heading(ui, "Most played");
+            widgets::grid(ui, top.len(), 160.0, |ui, i, w| {
+                let t = top[i];
+                let (resp, play) = widgets::tile(ui, w, &t.title, &t.artist, cx.accent, |ui, r| {
+                    widgets::cover(ui, cx.art, t.art.as_deref(), r, 6, widgets::track_fallback(t))
+                });
+                if play || resp.double_clicked() {
+                    cx.actions.push(Action::Cmd(Command::Play {
+                        tracks: top.iter().map(|t| (*t).clone()).collect(),
+                        start: i,
+                        context: "Most played".into(),
+                    }));
+                }
+                let track = t.clone();
+                resp.context_menu(|ui| widgets::track_menu(ui, cx, &track, None));
+            });
+            ui.add_space(10.0);
+        }
+
+        // Albums from your music folders, newest first, one row.
+        let mut fresh: Vec<&Album> = cx.lib.albums.iter().filter(|a| a.added > 0).collect();
+        if fresh.len() >= 2 {
+            fresh.sort_by_key(|a| std::cmp::Reverse(a.added));
+            fresh.truncate(tiles_per_row(ui, 168.0));
+            let fresh: Vec<LibAlbum> = fresh.into_iter().map(LibAlbum::Local).collect();
+            widgets::heading(ui, "Recently added");
+            album_grid(ui, cx, &fresh);
+            ui.add_space(10.0);
+        }
+
         // Your top artists (by songs in the library).
         let artists: Vec<&crate::library::Artist> = cx
             .lib
@@ -184,6 +223,7 @@ fn home(ui: &mut Ui, cx: &mut Cx) {
                 } else if resp.clicked() {
                     cx.actions.push(Action::Open(format!("local:artist:{}", a.key)));
                 }
+                resp.context_menu(|ui| widgets::songs_menu(ui, cx, &a.track_ids, &a.name, None));
             });
             ui.add_space(10.0);
         }
@@ -378,6 +418,20 @@ impl<'a> LibAlbum<'a> {
             LibAlbum::Saved(p) => &p.track_ids,
         }
     }
+
+    /// When its newest song came into the library.
+    fn added(self, lib: &Library) -> i64 {
+        match self {
+            LibAlbum::Local(a) => a.added,
+            LibAlbum::Saved(p) => p
+                .track_ids
+                .iter()
+                .filter_map(|id| lib.get(id))
+                .map(|t| t.added_at)
+                .max()
+                .unwrap_or(0),
+        }
+    }
 }
 
 /// Every album in the library by artist, then title; `only` keeps the ones from one source.
@@ -422,6 +476,10 @@ fn album_grid(ui: &mut Ui, cx: &mut Cx, albums: &[LibAlbum]) {
                 LibAlbum::Saved(p) => View::Playlist(p.id.clone()),
             }));
         }
+        resp.context_menu(|ui| {
+            let go = (!a.artist().is_empty()).then(|| widgets::artist_action(cx.lib, a.artist()));
+            widgets::songs_menu(ui, cx, a.track_ids(), a.name(), go);
+        });
     });
 }
 
@@ -472,6 +530,7 @@ fn collection_row(ui: &mut Ui, cx: &mut Cx, title: &str, hits: &[CollectionHit])
         if play || resp.clicked() {
             cx.actions.push(Action::Open(h.key.clone()));
         }
+        resp.context_menu(|ui| widgets::page_menu(ui, cx, &h.key));
     });
     ui.add_space(8.0);
 }
@@ -727,8 +786,29 @@ fn songs(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
     });
 }
 
+/// How the Albums page orders its albums.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum AlbumSort {
+    #[default]
+    Artist,
+    Title,
+    Added,
+}
+
+impl AlbumSort {
+    fn label(self) -> &'static str {
+        match self {
+            AlbumSort::Artist => "Artist",
+            AlbumSort::Title => "Title",
+            AlbumSort::Added => "Recently added",
+        }
+    }
+}
+
 fn albums(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
     page(ui, "albums", |ui, _viewport, _origin| {
+        let sort_id = Id::new("albums-sort");
+        let mut sort: AlbumSort = ui.data(|d| d.get_temp(sort_id)).unwrap_or_default();
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Albums").font(theme::bold_font(26.0)));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -737,6 +817,16 @@ fn albums(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
                         .hint_text(theme::ic(icon::MAGNIFYING_GLASS, "Filter"))
                         .desired_width(200.0),
                 );
+                ui.menu_button(theme::ic(icon::SORT_ASCENDING, sort.label()), |ui| {
+                    ui.set_min_width(170.0);
+                    for by in [AlbumSort::Artist, AlbumSort::Title, AlbumSort::Added] {
+                        if ui.add(egui::Button::selectable(sort == by, by.label())).clicked() {
+                            sort = by;
+                            ui.data_mut(|d| d.insert_temp(sort_id, by));
+                            ui.close();
+                        }
+                    }
+                });
             });
         });
         ui.add_space(12.0);
@@ -763,7 +853,7 @@ fn albums(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
             only = None;
         }
         let needle = st.filter_text.trim().to_lowercase();
-        let list: Vec<LibAlbum> = everything
+        let mut list: Vec<LibAlbum> = everything
             .into_iter()
             .filter(|a| only.is_none_or(|s| a.source() == s))
             .filter(|a| {
@@ -772,6 +862,11 @@ fn albums(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
                     || a.artist().to_lowercase().contains(&needle)
             })
             .collect();
+        match sort {
+            AlbumSort::Artist => {}
+            AlbumSort::Title => list.sort_by_cached_key(|a| crate::library::sort_key(a.name())),
+            AlbumSort::Added => list.sort_by_cached_key(|a| std::cmp::Reverse(a.added(cx.lib))),
+        }
         if list.is_empty() {
             panels::empty_state(
                 ui,
@@ -828,6 +923,7 @@ fn artists(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
             } else if resp.clicked() {
                 cx.actions.push(Action::Open(format!("local:artist:{}", a.key)));
             }
+            resp.context_menu(|ui| widgets::songs_menu(ui, cx, &a.track_ids, &a.name, None));
         });
     });
 }
@@ -1468,6 +1564,12 @@ fn search(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
                     _ if resp.clicked() => cx.actions.push(Action::Open(a.key.clone())),
                     _ => {}
                 }
+                match library_artist {
+                    Some(artist) => {
+                        resp.context_menu(|ui| widgets::songs_menu(ui, cx, &artist.track_ids, &artist.name, None))
+                    }
+                    None => resp.context_menu(|ui| widgets::page_menu(ui, cx, &a.key)),
+                };
             });
             ui.add_space(8.0);
         }
@@ -1974,6 +2076,15 @@ fn downloads(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
             if active > 0 && widgets::pill(ui, "Cancel all", HOVER, TEXT).clicked() {
                 cx.actions.push(Action::Cmd(Command::CancelDownloads));
             }
+            let failed: Vec<Track> = rows
+                .iter()
+                .filter(|r| matches!(r.state, DownloadState::Failed(_)))
+                .map(|r| r.track.clone())
+                .collect();
+            if !failed.is_empty() && widgets::pill(ui, &format!("Retry {} failed", failed.len()), HOVER, TEXT).clicked()
+            {
+                cx.actions.push(Action::Cmd(Command::Download(failed)));
+            }
             if finished > 0 && widgets::pill(ui, "Clear list", HOVER, TEXT).clicked() {
                 cx.actions.push(Action::Cmd(Command::ClearDownloads));
             }
@@ -2191,11 +2302,23 @@ fn now_playing(ui: &mut Ui, cx: &mut Cx) {
             if widgets::icon_button(ui, icon::CORNERS_IN, 18.0, TEXT, "Close (Esc)").clicked() {
                 cx.actions.push(Action::Back);
             }
-            ui.label(
-                egui::RichText::new(format!("PLAYING FROM {}", cx.player.context.to_uppercase()))
-                    .size(12.0)
-                    .color(TEXT_DIM),
-            );
+            let text = egui::RichText::new(format!("PLAYING FROM {}", cx.player.context.to_uppercase()))
+                .size(12.0)
+                .color(TEXT_DIM);
+            match widgets::context_action(cx) {
+                Some(go) => {
+                    let link = ui
+                        .add(egui::Label::new(text).sense(Sense::click()))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Go to it");
+                    if link.clicked() {
+                        cx.actions.push(go);
+                    }
+                }
+                None => {
+                    ui.label(text);
+                }
+            }
         });
         ui.add_space(12.0);
         let avail = ui.available_size();
@@ -2239,10 +2362,34 @@ fn track_titles(ui: &mut Ui, cx: &mut Cx, t: &Track, w: f32) {
     let (r, _) = ui.allocate_exact_size(vec2(w, 36.0), Sense::hover());
     text_trunc(ui, r.min, &t.title, theme::bold_font(28.0), TEXT, w);
     let (r, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
-    text_trunc(ui, r.min, &t.artist, theme::font(17.0), TEXT_DIM, w);
+    let artist = widgets::link_text(
+        ui,
+        Id::new("np-big-artist"),
+        r.min,
+        &t.artist,
+        theme::font(17.0),
+        TEXT_DIM,
+        w,
+    );
+    if artist.clicked() {
+        cx.actions.push(widgets::artist_action(cx.lib, &t.artist));
+    }
     if !t.album.is_empty() {
         let (r, _) = ui.allocate_exact_size(vec2(w, 20.0), Sense::hover());
-        text_trunc(ui, r.min, &t.album, theme::font(13.5), TEXT_FAINT, w);
+        let album = widgets::link_text(
+            ui,
+            Id::new("np-big-album"),
+            r.min,
+            &t.album,
+            theme::font(13.5),
+            TEXT_FAINT,
+            w,
+        );
+        if album.clicked() {
+            if let Some(go) = widgets::album_action(cx.lib, t) {
+                cx.actions.push(go);
+            }
+        }
     }
     ui.add_space(4.0);
     let source = cx.player.via.as_ref().map(|v| v.source).unwrap_or(t.source);

@@ -63,9 +63,25 @@ pub struct Track {
     pub uri: String,
     /// Unix seconds when this was added to the library/playlist (0 = unknown).
     pub added_at: i64,
+    /// The album's artist when it isn't the song's (compilations, songs "feat." someone).
+    /// Empty: the song's artist.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub album_artist: String,
+    /// Disc of a multi-disc album.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disc_no: Option<u32>,
 }
 
 impl Track {
+    /// Whose album this is: the album artist, else the song's artist.
+    pub fn album_by(&self) -> &str {
+        if self.album_artist.trim().is_empty() {
+            &self.artist
+        } else {
+            &self.album_artist
+        }
+    }
+
     pub fn local_id(path: &str) -> String {
         format!("local:{path}")
     }

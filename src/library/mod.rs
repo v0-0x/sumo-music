@@ -15,6 +15,8 @@ use crate::model::{match_key, Playlist, PlaylistKind, Source, Track};
 pub use db::Db;
 
 pub const LIKED_ID: &str = "liked";
+/// How many of the most played songs the library keeps at hand.
+pub const MOST_PLAYED: usize = 24;
 
 #[derive(Debug, Clone)]
 pub struct Album {
@@ -23,6 +25,8 @@ pub struct Album {
     pub artist: String,
     pub art: Option<String>,
     pub track_ids: Vec<String>,
+    /// When its newest song was added (unix seconds).
+    pub added: i64,
 }
 
 /// An artist with songs in the library (local files or any playlist).
@@ -48,6 +52,8 @@ pub struct Library {
     pub artists: Vec<Artist>,
     /// Recently played track ids, newest first.
     pub recent: Vec<String>,
+    /// Track ids played at least twice, most played first.
+    pub most_played: Vec<String>,
     /// Bumped on every change so views can invalidate caches.
     pub version: u64,
     liked: HashSet<String>,
@@ -55,6 +61,8 @@ pub struct Library {
     local_match: HashMap<String, String>,
     /// Artist key -> index into `artists`.
     artist_index: HashMap<String, usize>,
+    /// Local track id -> index into `albums`.
+    album_of: HashMap<String, usize>,
 }
 
 impl Library {
@@ -63,6 +71,7 @@ impl Library {
             tracks: db.load_tracks()?.into_iter().map(|t| (t.id.clone(), t)).collect(),
             playlists: db.load_playlists()?,
             recent: db.recent_plays(50)?,
+            most_played: db.top_plays(MOST_PLAYED)?,
             ..Default::default()
         };
         if !lib.playlists.iter().any(|p| p.id == LIKED_ID) {
@@ -79,8 +88,9 @@ impl Library {
         // change while the UI waits).
         local.sort_by_cached_key(|t| {
             (
-                sort_key(&t.artist),
+                sort_key(t.album_by()),
                 sort_key(&t.album),
+                t.disc_no.unwrap_or(0),
                 t.track_no.unwrap_or(0),
                 t.title.clone(),
             )
@@ -91,21 +101,29 @@ impl Library {
         self.local_match.clear();
         for t in &local {
             self.local_match.entry(t.match_key()).or_insert_with(|| t.id.clone());
-            let key = format!("{}\u{1f}{}", sort_key(&t.album), sort_key(&t.artist));
+            // By album artist: a compilation or an album with guests stays one album.
+            let key = format!("{}\u{1f}{}", sort_key(&t.album), sort_key(t.album_by()));
             let idx = *album_index.entry(key.clone()).or_insert_with(|| {
                 albums.push(Album {
                     key,
                     name: t.album.clone(),
-                    artist: t.artist.clone(),
+                    artist: t.album_by().to_string(),
                     art: t.art.clone(),
                     track_ids: Vec::new(),
+                    added: 0,
                 });
                 albums.len() - 1
             });
             albums[idx].track_ids.push(t.id.clone());
+            albums[idx].added = albums[idx].added.max(t.added_at);
         }
         self.local = local.iter().map(|t| t.id.clone()).collect();
         albums.sort_by_cached_key(|a| (sort_key(&a.artist), a.name.clone()));
+        self.album_of = albums
+            .iter()
+            .enumerate()
+            .flat_map(|(i, a)| a.track_ids.iter().map(move |id| (id.clone(), i)))
+            .collect();
         self.albums = albums;
 
         self.liked = self
@@ -168,6 +186,11 @@ impl Library {
         artists.sort_by_cached_key(|a| (std::cmp::Reverse(a.track_ids.len()), sort_key(&a.name)));
         self.artist_index = artists.iter().enumerate().map(|(i, a)| (a.key.clone(), i)).collect();
         self.artists = artists;
+    }
+
+    /// The library album a local song is on.
+    pub fn album_of(&self, track_id: &str) -> Option<&Album> {
+        self.album_of.get(track_id).and_then(|&i| self.albums.get(i))
     }
 
     pub fn artist(&self, key: &str) -> Option<&Artist> {
@@ -326,6 +349,90 @@ pub fn liked_playlist() -> Playlist {
     }
 }
 
+/// Moves the songs at `rows` (index and id, in case the list changed since) of a playlist to
+/// before position `to` (as counted before the move), keeping their order.
+pub fn move_rows(ids: &mut Vec<String>, rows: &[(usize, String)], to: usize) {
+    let mut at: Vec<usize> = Vec::with_capacity(rows.len());
+    for (index, id) in rows {
+        let found = if ids.get(*index) == Some(id) && !at.contains(index) {
+            Some(*index)
+        } else {
+            (0..ids.len()).find(|i| ids[*i] == *id && !at.contains(i))
+        };
+        at.extend(found);
+    }
+    if at.is_empty() {
+        return;
+    }
+    at.sort_unstable();
+    let moving: Vec<String> = at.iter().map(|&i| ids[i].clone()).collect();
+    for &i in at.iter().rev() {
+        ids.remove(i);
+    }
+    let before = at.iter().filter(|&&i| i < to).count();
+    let to = to.saturating_sub(before).min(ids.len());
+    ids.splice(to..to, moving);
+}
+
+/// How a song list can be sorted (`Custom` keeps the list's own order).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SortBy {
+    #[default]
+    Custom,
+    Title,
+    Artist,
+    Album,
+    /// Newest first.
+    Added,
+    Duration,
+}
+
+impl SortBy {
+    pub const ALL: [SortBy; 6] = [
+        SortBy::Custom,
+        SortBy::Title,
+        SortBy::Artist,
+        SortBy::Album,
+        SortBy::Added,
+        SortBy::Duration,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortBy::Custom => "Custom order",
+            SortBy::Title => "Title",
+            SortBy::Artist => "Artist",
+            SortBy::Album => "Album",
+            SortBy::Added => "Recently added",
+            SortBy::Duration => "Duration",
+        }
+    }
+}
+
+/// The positions of `tracks` in the order `by` (reversed with `desc`) puts them.
+pub fn sort_order(tracks: &[&Track], by: SortBy, desc: bool) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..tracks.len()).collect();
+    let place = |t: &Track| (t.disc_no.unwrap_or(0), t.track_no.unwrap_or(0));
+    match by {
+        SortBy::Custom => {}
+        SortBy::Title => order.sort_by_cached_key(|&i| (sort_key(&tracks[i].title), sort_key(&tracks[i].artist))),
+        SortBy::Artist => order.sort_by_cached_key(|&i| {
+            let t = tracks[i];
+            (sort_key(&t.artist), sort_key(&t.album), place(t))
+        }),
+        SortBy::Album => order.sort_by_cached_key(|&i| {
+            let t = tracks[i];
+            (sort_key(&t.album), sort_key(t.album_by()), place(t))
+        }),
+        SortBy::Added => order.sort_by_key(|&i| std::cmp::Reverse(tracks[i].added_at)),
+        SortBy::Duration => order.sort_by_key(|&i| tracks[i].duration_ms),
+    }
+    if desc {
+        order.reverse();
+    }
+    order
+}
+
 /// Case-insensitive sort key that ignores a leading "The ".
 pub fn sort_key(s: &str) -> String {
     let l = s.trim().to_lowercase();
@@ -338,6 +445,8 @@ mod tests {
 
     fn t(id: &str, artist: &str, album: &str, title: &str, no: u32) -> Track {
         Track {
+            album_artist: String::new(),
+            disc_no: None,
             id: id.into(),
             source: if id.starts_with("local:") {
                 Source::Local
@@ -353,6 +462,72 @@ mod tests {
             uri: id.into(),
             added_at: 0,
         }
+    }
+
+    #[test]
+    fn moving_playlist_rows() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let row = |i: usize, id: &str| (i, id.to_string());
+        let mut list = ids(&["a", "b", "c", "d", "e"]);
+        // "b" and "d" dragged to the top keep their order.
+        move_rows(&mut list, &[row(1, "b"), row(3, "d")], 0);
+        assert_eq!(list, ids(&["b", "d", "a", "c", "e"]));
+        // Down past "e" (the end).
+        move_rows(&mut list, &[row(0, "b")], 5);
+        assert_eq!(list, ids(&["d", "a", "c", "e", "b"]));
+        // Stale positions are found by id.
+        move_rows(&mut list, &[row(0, "e")], 1);
+        assert_eq!(list, ids(&["d", "e", "a", "c", "b"]));
+        // Nothing to move, nothing changes.
+        move_rows(&mut list, &[row(9, "zz")], 0);
+        assert_eq!(list, ids(&["d", "e", "a", "c", "b"]));
+    }
+
+    #[test]
+    fn sorting_lists() {
+        let mut a = t("local:a", "The Zombies", "Odessey", "b song", 2);
+        a.added_at = 10;
+        a.duration_ms = 300;
+        let mut b = t("local:b", "Abba", "Gold", "A song", 1);
+        b.added_at = 30;
+        b.duration_ms = 100;
+        let mut c = t("local:c", "Abba", "Arrival", "c song", 1);
+        c.added_at = 20;
+        c.duration_ms = 200;
+        let tracks = [&a, &b, &c];
+        assert_eq!(sort_order(&tracks, SortBy::Custom, false), [0, 1, 2]);
+        assert_eq!(sort_order(&tracks, SortBy::Title, false), [1, 0, 2]);
+        assert_eq!(sort_order(&tracks, SortBy::Title, true), [2, 0, 1]);
+        assert_eq!(sort_order(&tracks, SortBy::Artist, false), [2, 1, 0]);
+        assert_eq!(sort_order(&tracks, SortBy::Album, false), [2, 1, 0]);
+        assert_eq!(sort_order(&tracks, SortBy::Added, false), [1, 2, 0]);
+        assert_eq!(sort_order(&tracks, SortBy::Duration, false), [1, 2, 0]);
+    }
+
+    /// A compilation (one album artist, many song artists) is one album, and a two-disc
+    /// album plays disc 1 before disc 2.
+    #[test]
+    fn albums_go_by_album_artist_and_disc() {
+        let mut lib = Library::default();
+        let mut add = |id: &str, artist: &str, title: &str, disc: u32, no: u32| {
+            let mut track = t(id, artist, "Hits", title, no);
+            track.album_artist = "Various Artists".into();
+            track.disc_no = Some(disc);
+            lib.tracks.insert(track.id.clone(), track);
+        };
+        add("local:a", "Zed", "Last of disc 2", 2, 1);
+        add("local:b", "Abe", "First of disc 1", 1, 1);
+        add("local:c", "Moe", "Second of disc 1", 1, 2);
+        lib.reindex();
+        assert_eq!(lib.albums.len(), 1);
+        let album = &lib.albums[0];
+        assert_eq!(album.artist, "Various Artists");
+        assert_eq!(album.track_ids, ["local:b", "local:c", "local:a"]);
+        assert_eq!(
+            lib.album_of("local:a").map(|a| a.key.as_str()),
+            Some(album.key.as_str())
+        );
+        assert!(lib.album_of("spotify:track:x").is_none());
     }
 
     #[test]

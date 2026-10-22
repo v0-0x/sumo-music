@@ -172,6 +172,8 @@ fn xml_track(d: &plist::Dictionary, track_id: i64) -> Option<Track> {
     };
 
     Some(Track {
+        album_artist: String::new(),
+        disc_no: None,
         id,
         source,
         title,
@@ -648,6 +650,8 @@ pub fn parse_library_song(v: &Json) -> Option<Track> {
         return None;
     }
     Some(Track {
+        album_artist: String::new(),
+        disc_no: None,
         id: Track::applemusic_id(id),
         source: Source::AppleMusic,
         title: title.to_owned(),
@@ -1291,6 +1295,8 @@ mod tests {
         assert_eq!(
             track,
             Track {
+                album_artist: String::new(),
+                disc_no: None,
                 id: "applemusic:i.PkdZbQXsXwm6P0".into(),
                 source: Source::AppleMusic,
                 title: "Get Lucky (feat. Pharrell Williams & Nile Rodgers)".into(),

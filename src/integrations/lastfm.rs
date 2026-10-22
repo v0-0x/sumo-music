@@ -942,6 +942,8 @@ mod tests {
 
     fn track(artist: &str, title: &str) -> Track {
         Track {
+            album_artist: String::new(),
+            disc_no: None,
             id: "local:/x.flac".into(),
             source: Source::Local,
             title: title.into(),
@@ -1043,6 +1045,8 @@ mod tests {
 
     fn upload(title: &str, uploader: &str) -> Track {
         Track {
+            album_artist: String::new(),
+            disc_no: None,
             id: "soundcloud:1".into(),
             source: Source::SoundCloud,
             title: title.into(),

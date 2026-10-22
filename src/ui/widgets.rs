@@ -9,6 +9,7 @@ use egui_phosphor::regular as icon;
 use super::art::{ArtCache, MEDIUM, THUMB};
 use super::theme::{self, *};
 use super::{Action, Cx, View};
+use crate::library::{sort_order, SortBy};
 use crate::model::{Playlist, PlaylistKind, Source, Track};
 use crate::service::{Command, DownloadState, Feed, PlayStatus};
 
@@ -582,6 +583,21 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
     let title_w = if show_album { flex * 0.58 } else { flex };
     let album_x = num_w + title_w + 16.0;
 
+    // A sorted table shows the songs in another order: `order` maps a shown row back to its
+    // place in the list.
+    let sort_id = Id::new(("table-sort", opts.id, opts.context));
+    let sort: TableSort = ui.data(|d| d.get_temp(sort_id)).unwrap_or_default();
+    let order = (sort.by != SortBy::Custom).then(|| sorted_rows(ui, cx, tracks, opts.id, sort));
+    let order = order.as_deref().map(Vec::as_slice);
+    let sorted: Vec<&Track>;
+    let tracks: &[&Track] = match order {
+        Some(o) => {
+            sorted = o.iter().map(|&i| tracks[i]).collect();
+            &sorted
+        }
+        None => tracks,
+    };
+
     if opts.show_header {
         let list = list_key(opts.context, tracks);
         let picked = ui.data_mut(|d| {
@@ -594,32 +610,86 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
         });
         let (hrect, _) = ui.allocate_exact_size(vec2(width, 32.0), Sense::hover());
         let f = theme::font(12.0);
-        let p = ui.painter();
-        p.text(
-            hrect.left_center() + vec2(num_w * 0.5, 0.0),
-            Align2::CENTER_CENTER,
-            "#",
-            f.clone(),
-            TEXT_FAINT,
-        );
-        p.text(
-            hrect.left_center() + vec2(num_w + 8.0, 0.0),
+        let mut new_sort = sort;
+        let head_id = |what: &str| Id::new((opts.id, "head", what.to_string()));
+        let arrow = |by: SortBy| (sort.by == by).then_some(sort.desc);
+
+        // "#" holds every way to sort.
+        let num_rect = Rect::from_min_size(hrect.min, vec2(num_w, hrect.height()));
+        let menu = ui
+            .interact(num_rect, head_id("sort"), Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text("Sort");
+        let (glyph, font, color) = match (sort.by, sort.desc) {
+            (SortBy::Custom, _) if !menu.hovered() => ("#", f.clone(), TEXT_FAINT),
+            (SortBy::Custom, _) => (icon::SORT_ASCENDING, theme::icon_font(14.0), TEXT),
+            (_, false) => (icon::SORT_ASCENDING, theme::icon_font(14.0), cx.accent),
+            (_, true) => (icon::SORT_DESCENDING, theme::icon_font(14.0), cx.accent),
+        };
+        ui.painter()
+            .text(num_rect.center(), Align2::CENTER_CENTER, glyph, font, color);
+        egui::Popup::menu(&menu).show(|ui| {
+            ui.set_min_width(190.0);
+            ui.label(egui::RichText::new("Sort by").small().color(TEXT_FAINT));
+            for by in SortBy::ALL {
+                let on = sort.by == by;
+                let mut button = egui::Button::selectable(on, by.label());
+                if on && by != SortBy::Custom {
+                    let arrow = if sort.desc { icon::ARROW_DOWN } else { icon::ARROW_UP };
+                    button = button.right_text(egui::RichText::new(arrow).font(theme::icon_font(13.0)));
+                }
+                if ui.add(button).clicked() {
+                    new_sort = if by == SortBy::Custom {
+                        TableSort::default()
+                    } else {
+                        TableSort {
+                            by,
+                            desc: on && !sort.desc,
+                        }
+                    };
+                    ui.close();
+                }
+            }
+        });
+
+        // The column names sort by themselves: up, down, then back to the list's own order.
+        // Sorting by artist or date shows next to "Title", the column that holds them.
+        let (title_label, title_by) = match sort.by {
+            SortBy::Artist => ("Title · Artist", SortBy::Artist),
+            SortBy::Added => ("Title · Recently added", SortBy::Added),
+            _ => ("Title", SortBy::Title),
+        };
+        let at = |x: f32| hrect.left_center() + vec2(x, 0.0);
+        let title = sort_heading(
+            ui,
+            head_id("title"),
+            at(num_w + 8.0),
             Align2::LEFT_CENTER,
-            "Title",
+            title_label,
             f.clone(),
-            TEXT_FAINT,
+            arrow(title_by),
+            cx.accent,
         );
+        if title.clicked() {
+            new_sort = sort.click(title_by);
+        }
         if show_album {
-            p.text(
-                hrect.left_center() + vec2(album_x, 0.0),
+            let album = sort_heading(
+                ui,
+                head_id("album"),
+                at(album_x),
                 Align2::LEFT_CENTER,
                 "Album",
                 f.clone(),
-                TEXT_FAINT,
+                arrow(SortBy::Album),
+                cx.accent,
             );
+            if album.clicked() {
+                new_sort = sort.click(SortBy::Album);
+            }
         }
         if picked > 1 {
-            p.text(
+            ui.painter().text(
                 hrect.right_center() - vec2(dur_w + icons_w, 0.0),
                 Align2::RIGHT_CENTER,
                 format!("{picked} selected · Ctrl+C to copy"),
@@ -627,20 +697,29 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
                 TEXT_DIM,
             );
         }
-        p.text(
-            hrect.right_center() - vec2(20.0, 0.0),
+        let duration = sort_heading(
+            ui,
+            head_id("duration"),
+            hrect.right_center() - vec2(14.0, 0.0),
             Align2::RIGHT_CENTER,
             icon::CLOCK,
             theme::icon_font(13.0),
-            TEXT_FAINT,
+            arrow(SortBy::Duration),
+            cx.accent,
         );
-        p.line_segment(
+        if duration.clicked() {
+            new_sort = sort.click(SortBy::Duration);
+        }
+        ui.painter().line_segment(
             [
                 hrect.left_bottom() + vec2(0.0, -1.0),
                 hrect.right_bottom() + vec2(0.0, -1.0),
             ],
             Stroke::new(1.0, theme::with_alpha(Color32::WHITE, 18)),
         );
+        if new_sort != sort {
+            ui.data_mut(|d| d.insert_temp(sort_id, new_sort));
+        }
         ui.add_space(6.0);
     }
 
@@ -665,13 +744,37 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
         (first..last).map(|i| sel.has(i)).collect()
     });
     if is_active_table(ui, opts.id) {
-        table_keys(ui, cx, tracks, opts, sel_id);
+        table_keys(ui, cx, tracks, opts, sel_id, order);
     }
+    // Your own playlists, whole and in their own order, can be rearranged by dragging songs.
+    let reorder = opts
+        .playlist
+        .filter(|p| takes_songs(p) && order.is_none() && p.track_ids.len() == n);
+    let drag_id = Id::new(("table-drag", opts.id));
+    let row_sense = if reorder.is_some() {
+        Sense::click_and_drag()
+    } else {
+        Sense::click()
+    };
+    let dragging: Option<Vec<usize>> = ui.data(|d| d.get_temp(drag_id));
 
     for i in first..last {
         let t = tracks[i];
         let row = Rect::from_min_size(rect.min + vec2(0.0, i as f32 * ROW_H), vec2(width, ROW_H));
-        let resp = ui.interact(row, Id::new((opts.id, i)), Sense::click());
+        let resp = ui.interact(row, Id::new((opts.id, i)), row_sense);
+        if reorder.is_some() && resp.drag_started() {
+            // A picked song takes the other picked ones along.
+            let rows = if selected[i - first] {
+                ui.data(|d| d.get_temp::<Selection>(sel_id)).unwrap_or_default().rows(n)
+            } else {
+                vec![i]
+            };
+            ui.data_mut(|d| d.insert_temp(drag_id, rows));
+        }
+        if dragging.as_ref().is_some_and(|rows| rows.contains(&i)) {
+            ui.painter()
+                .rect_filled(row, CornerRadius::same(10), theme::with_alpha(cx.accent, 24));
+        }
         let is_current = current_id == Some(t.id.as_str());
         let hovered = ui.rect_contains_pointer(row) || resp.context_menu_opened();
         if selected[i - first] {
@@ -837,11 +940,145 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
         resp.context_menu(|ui| {
             let rows = ui.data(|d| d.get_temp::<Selection>(sel_id)).unwrap_or_default().rows(n);
             if rows.len() > 1 && rows.contains(&i) {
-                selection_menu(ui, cx, tracks, &rows, opts.playlist);
+                selection_menu(ui, cx, tracks, &rows, opts.playlist, order);
             } else {
-                track_menu(ui, cx, t, Some((opts.playlist, i)));
+                track_menu(ui, cx, t, Some((opts.playlist, order.map_or(i, |o| o[i]))));
             }
         });
+    }
+    if let (Some(p), Some(rows)) = (reorder, dragging) {
+        drag_rows(ui, cx, p, tracks, rows, rect, (drag_id, sel_id));
+    }
+}
+
+/// How a table is sorted, picked in its header.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
+struct TableSort {
+    by: SortBy,
+    desc: bool,
+}
+
+impl TableSort {
+    /// A click on a column name: sorts by it, then the other way round, then not at all.
+    fn click(self, by: SortBy) -> Self {
+        match (self.by == by, self.desc) {
+            (false, _) => TableSort { by, desc: false },
+            (true, false) => TableSort { by, desc: true },
+            (true, true) => TableSort::default(),
+        }
+    }
+}
+
+/// The order a sorted table shows its songs in, sorted again only when the list or the
+/// library changes.
+fn sorted_rows(ui: &Ui, cx: &Cx, tracks: &[&Track], table: &str, sort: TableSort) -> std::sync::Arc<Vec<usize>> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    list_key("", tracks).hash(&mut h);
+    for t in tracks {
+        std::ptr::hash(*t, &mut h);
+    }
+    cx.lib.version.hash(&mut h);
+    sort.hash(&mut h);
+    let key = h.finish();
+    let id = Id::new(("table-sorted", table));
+    match ui.data(|d| d.get_temp::<(u64, std::sync::Arc<Vec<usize>>)>(id)) {
+        Some((k, order)) if k == key => order,
+        _ => {
+            let order = std::sync::Arc::new(sort_order(tracks, sort.by, sort.desc));
+            ui.data_mut(|d| d.insert_temp(id, (key, order.clone())));
+            order
+        }
+    }
+}
+
+/// A column name in a table header that sorts by its column when clicked, with an arrow
+/// (`desc` or not) while it does.
+#[allow(clippy::too_many_arguments)]
+fn sort_heading(
+    ui: &Ui,
+    id: Id,
+    pos: Pos2,
+    align: Align2,
+    label: &str,
+    font: FontId,
+    desc: Option<bool>,
+    accent: Color32,
+) -> Response {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font, Color32::PLACEHOLDER);
+    let arrow_w = if desc.is_some() { 16.0 } else { 0.0 };
+    let rect = align.anchor_size(pos, galley.size() + vec2(arrow_w, 0.0));
+    let resp = ui
+        .interact(rect.expand2(vec2(6.0, 6.0)), id, Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand);
+    let color = if desc.is_some() || resp.hovered() {
+        TEXT
+    } else {
+        TEXT_FAINT
+    };
+    let text_pos = Pos2::new(rect.left(), rect.center().y - galley.size().y / 2.0);
+    ui.painter().galley(text_pos, galley, color);
+    if let Some(desc) = desc {
+        ui.painter().text(
+            Pos2::new(rect.right() - 6.0, rect.center().y),
+            Align2::CENTER_CENTER,
+            if desc { icon::CARET_DOWN } else { icon::CARET_UP },
+            theme::icon_font(11.0),
+            accent,
+        );
+    }
+    resp
+}
+
+/// Songs being dragged to another place in playlist `p`: a line shows where they'd land, and
+/// letting go moves them there. Near the top or bottom edge the list scrolls along.
+fn drag_rows(ui: &Ui, cx: &mut Cx, p: &Playlist, tracks: &[&Track], rows: Vec<usize>, rect: Rect, ids: (Id, Id)) {
+    let (drag_id, sel_id) = ids;
+    // A drag that ended elsewhere (the view changed meanwhile) is over.
+    if !ui.input(|i| i.pointer.any_down() || i.pointer.any_released()) {
+        ui.data_mut(|d| d.remove::<Vec<usize>>(drag_id));
+        return;
+    }
+    let Some(pointer) = ui.ctx().pointer_interact_pos() else {
+        return;
+    };
+    ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+    let n = tracks.len();
+    let to = (((pointer.y - rect.top()) / ROW_H).round().max(0.0) as usize).min(n);
+    let y = rect.top() + to as f32 * ROW_H;
+    ui.painter().hline(rect.x_range(), y, Stroke::new(2.0, cx.accent));
+
+    let clip = ui.clip_rect();
+    let edge = 48.0;
+    let step = if pointer.y < clip.top() + edge {
+        (clip.top() + edge - pointer.y).min(edge) / 3.0
+    } else if pointer.y > clip.bottom() - edge {
+        -(pointer.y - (clip.bottom() - edge)).min(edge) / 3.0
+    } else {
+        0.0
+    };
+    if step != 0.0 {
+        ui.scroll_with_delta(vec2(0.0, step));
+        ui.ctx().request_repaint();
+    }
+
+    if ui.input(|i| i.pointer.any_released()) {
+        ui.data_mut(|d| d.remove::<Vec<usize>>(drag_id));
+        // Dropping a run of songs right before or after itself changes nothing.
+        let first = rows.iter().copied().min().unwrap_or(0);
+        let last = rows.iter().copied().max().unwrap_or(0);
+        let run = last + 1 - first == rows.len();
+        if rows.is_empty() || (run && (first..=last + 1).contains(&to)) {
+            return;
+        }
+        cx.actions.push(Action::Cmd(Command::MovePlaylistTracks {
+            playlist_id: p.id.clone(),
+            rows: rows.iter().map(|&i| (i, tracks[i].id.clone())).collect(),
+            to,
+        }));
+        ui.data_mut(|d| d.get_temp_mut_or_default::<Selection>(sel_id).picked.clear());
     }
 }
 
@@ -934,7 +1171,7 @@ fn make_active_table(ui: &Ui, table: &str) {
 
 /// Ctrl+A picks every song, Ctrl+C copies the picked ones, Escape lets go of them. In your
 /// own playlists Ctrl+X cuts and Delete removes them.
-fn table_keys(ui: &Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts, sel_id: Id) {
+fn table_keys(ui: &Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts, sel_id: Id, order: Option<&[usize]>) {
     if ui.ctx().text_edit_focused() {
         return;
     }
@@ -971,7 +1208,7 @@ fn table_keys(ui: &Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts, sel_id:
         copy_songs(ui.ctx(), cx, rows.iter().map(|i| tracks[*i].clone()).collect());
     }
     if let Some(p) = own.filter(|_| cut || delete) {
-        remove_rows(cx, p, tracks, &rows);
+        remove_rows(cx, p, tracks, &rows, order);
         ui.data_mut(|d| d.get_temp_mut_or_default::<Selection>(sel_id).picked.clear());
     }
 }
@@ -981,10 +1218,14 @@ pub fn takes_songs(p: &Playlist) -> bool {
     matches!(p.kind, PlaylistKind::Custom | PlaylistKind::M3u)
 }
 
-fn remove_rows(cx: &mut Cx, p: &Playlist, tracks: &[&Track], rows: &[usize]) {
+/// Removes the songs at `rows` of a table showing playlist `p` (sorted by `order`).
+fn remove_rows(cx: &mut Cx, p: &Playlist, tracks: &[&Track], rows: &[usize], order: Option<&[usize]>) {
     cx.actions.push(Action::Cmd(Command::RemoveFromPlaylist {
         playlist_id: p.id.clone(),
-        rows: rows.iter().map(|i| (*i, tracks[*i].id.clone())).collect(),
+        rows: rows
+            .iter()
+            .map(|&i| (order.map_or(i, |o| o[i]), tracks[i].id.clone()))
+            .collect(),
     }));
 }
 
@@ -1014,6 +1255,82 @@ pub fn copy_songs(ctx: &egui::Context, cx: &mut Cx, tracks: Vec<Track>) {
     cx.actions.push(Action::Cmd(Command::Notify(format!(
         "Copied {count}. Open one of your playlists and press Ctrl+V to add them"
     ))));
+}
+
+/// Right-click menu for a group of songs (an album's, an artist's): play, queue or add them
+/// to a playlist. `go` adds a way to its artist.
+pub fn songs_menu(ui: &mut Ui, cx: &mut Cx, track_ids: &[String], context: &str, go: Option<Action>) {
+    ui.set_min_width(200.0);
+    let tracks = || cx.lib.tracks_for(track_ids);
+    if ui.button(theme::ic(icon::PLAY, "Play")).clicked() {
+        cx.actions.push(Action::Cmd(Command::Play {
+            tracks: tracks(),
+            start: first_song(cx, track_ids.len()),
+            context: context.to_string(),
+        }));
+        ui.close();
+    }
+    if ui.button(theme::ic(icon::QUEUE, "Play next")).clicked() {
+        cx.actions.push(Action::Cmd(Command::PlayNext(tracks())));
+        ui.close();
+    }
+    if ui.button(theme::ic(icon::LIST_PLUS, "Add to queue")).clicked() {
+        cx.actions.push(Action::Cmd(Command::Enqueue(tracks())));
+        ui.close();
+    }
+    ui.menu_button(theme::ic(icon::PLUS, "Add to playlist"), |ui| {
+        ui.set_min_width(200.0);
+        if ui.button(theme::ic(icon::PLUS, "New playlist…")).clicked() {
+            cx.actions.push(Action::NewPlaylist(tracks()));
+            ui.close();
+        }
+        ui.separator();
+        for p in cx.lib.playlists.iter().filter(|p| takes_songs(p)) {
+            if ui.button(&p.name).clicked() {
+                cx.actions.push(Action::Cmd(Command::AddToPlaylist {
+                    playlist_id: p.id.clone(),
+                    tracks: tracks(),
+                }));
+                ui.close();
+            }
+        }
+    });
+    if let Some(go) = go {
+        ui.separator();
+        if ui.button(theme::ic(icon::USER, "Go to artist")).clicked() {
+            cx.actions.push(go);
+            ui.close();
+        }
+    }
+}
+
+/// Right-click menu for an album or playlist from search: open it, or its link.
+pub fn page_menu(ui: &mut Ui, cx: &mut Cx, key: &str) {
+    ui.set_min_width(200.0);
+    if ui.button(theme::ic(icon::ARROW_SQUARE_OUT, "Open")).clicked() {
+        cx.actions.push(Action::Open(key.to_string()));
+        ui.close();
+    }
+    if let Some(link) = page_link(key) {
+        if ui.button(theme::ic(icon::LINK, "Copy link")).clicked() {
+            ui.ctx().copy_text(link.clone());
+            cx.actions.push(Action::Cmd(Command::Notify("Link copied".into())));
+            ui.close();
+        }
+        if ui.button(theme::ic(icon::GLOBE, "Open in browser")).clicked() {
+            cx.actions.push(Action::OpenUrl(link));
+            ui.close();
+        }
+    }
+}
+
+/// The web link of a Spotify album or playlist page key (SoundCloud's keys are links).
+pub fn page_link(key: &str) -> Option<String> {
+    if key.starts_with("https://") {
+        return Some(key.to_string());
+    }
+    let (kind, id) = key.strip_prefix("spotify:")?.split_once(':')?;
+    matches!(kind, "album" | "playlist" | "artist").then(|| format!("https://open.spotify.com/{kind}/{id}"))
 }
 
 /// "1 song" / "12 songs".
@@ -1082,7 +1399,14 @@ pub fn paste(cx: &mut Cx, p: &Playlist, text: Option<&str>, copied: Option<std::
 }
 
 /// The right-click menu for several picked songs.
-fn selection_menu(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], rows: &[usize], playlist: Option<&Playlist>) {
+fn selection_menu(
+    ui: &mut Ui,
+    cx: &mut Cx,
+    tracks: &[&Track],
+    rows: &[usize],
+    playlist: Option<&Playlist>,
+    order: Option<&[usize]>,
+) {
     ui.set_min_width(220.0);
     let picked = || rows.iter().map(|i| tracks[*i].clone()).collect::<Vec<Track>>();
     let count = songs(rows.len());
@@ -1097,6 +1421,23 @@ fn selection_menu(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], rows: &[usize], p
     }
     if ui.button(theme::ic(icon::LIST_PLUS, "Add to queue")).clicked() {
         cx.actions.push(Action::Cmd(Command::Enqueue(picked())));
+        ui.close();
+    }
+    // Saves the ones not liked yet, or when all are, removes them.
+    let unliked: Vec<Track> = rows
+        .iter()
+        .map(|i| tracks[*i])
+        .filter(|t| !cx.lib.is_liked(&t.id))
+        .cloned()
+        .collect();
+    let (label, liked) = if unliked.is_empty() {
+        ("Remove from Liked Songs", false)
+    } else {
+        ("Save to Liked Songs", true)
+    };
+    if ui.button(theme::ic(icon::HEART, label)).clicked() {
+        let tracks = if liked { unliked } else { picked() };
+        cx.actions.push(Action::Cmd(Command::SetLiked { tracks, liked }));
         ui.close();
     }
     ui.menu_button(theme::ic(icon::PLUS, "Add to playlist"), |ui| {
@@ -1133,7 +1474,7 @@ fn selection_menu(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], rows: &[usize], p
             .button(theme::ic(icon::TRASH, "Remove from this playlist  (Delete)"))
             .clicked()
         {
-            remove_rows(cx, p, tracks, rows);
+            remove_rows(cx, p, tracks, rows, order);
             ui.close();
         }
     }
@@ -1181,6 +1522,52 @@ pub fn artist_action(lib: &crate::library::Library, artist: &str) -> Action {
         }
     }
     Action::Search(first.to_string())
+}
+
+/// Where "Go to album" leads for a song: its album in the library, a saved album holding it,
+/// else a search for the album. `None` when the song names no album.
+pub fn album_action(lib: &crate::library::Library, t: &Track) -> Option<Action> {
+    if t.album.trim().is_empty() {
+        return None;
+    }
+    if let Some(a) = lib.album_of(&t.id) {
+        return Some(Action::Go(View::Album(a.key.clone())));
+    }
+    if let Some(p) = lib
+        .playlists
+        .iter()
+        .find(|p| p.kind.is_album() && p.track_ids.contains(&t.id))
+    {
+        return Some(Action::Go(View::Playlist(p.id.clone())));
+    }
+    Some(Action::Search(format!("{} {}", t.album_by(), t.album)))
+}
+
+/// Where "Playing from …" leads: the list playback started from, when it can be found.
+pub fn context_action(cx: &Cx) -> Option<Action> {
+    let name = cx.player.context.as_str();
+    if name.is_empty() {
+        return None;
+    }
+    if name == "Local Files" {
+        return Some(Action::Go(View::Songs));
+    }
+    if let Some(query) = name.strip_prefix("Search: ") {
+        return Some(Action::Search(query.to_string()));
+    }
+    let first = cx.player.context_first.as_deref()?;
+    let holds = |ids: &[String]| ids.iter().any(|id| id == first);
+    if let Some(p) = cx.lib.playlists.iter().find(|p| p.name == name && holds(&p.track_ids)) {
+        return Some(Action::Go(View::Playlist(p.id.clone())));
+    }
+    if let Some(a) = cx.lib.albums.iter().find(|a| a.name == name && holds(&a.track_ids)) {
+        return Some(Action::Go(View::Album(a.key.clone())));
+    }
+    cx.lib
+        .artists
+        .iter()
+        .find(|a| a.name == name && holds(&a.track_ids))
+        .map(|a| Action::Go(View::Artist(a.key.clone())))
 }
 
 /// Where playing a whole list starts: a random song while shuffle is on (it stays on from
@@ -1251,7 +1638,16 @@ pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Opti
         }
         ui.separator();
         for p in cx.lib.playlists.iter().filter(|p| takes_songs(p)) {
-            if ui.button(&p.name).clicked() {
+            // Playlists that already hold the song say so; it isn't added twice.
+            let mut button = egui::Button::new(&p.name);
+            if p.track_ids.contains(&t.id) {
+                button = button.right_text(
+                    egui::RichText::new(icon::CHECK)
+                        .font(theme::icon_font(13.0))
+                        .color(TEXT_FAINT),
+                );
+            }
+            if ui.add(button).clicked() {
                 cx.actions.push(Action::Cmd(Command::AddToPlaylist {
                     playlist_id: p.id.clone(),
                     tracks: vec![t.clone()],
@@ -1301,6 +1697,16 @@ pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Opti
         }
     }
     ui.separator();
+    if ui.button(theme::ic(icon::USER, "Go to artist")).clicked() {
+        cx.actions.push(artist_action(cx.lib, &t.artist));
+        ui.close();
+    }
+    if let Some(go) = album_action(cx.lib, t) {
+        if ui.button(theme::ic(icon::VINYL_RECORD, "Go to album")).clicked() {
+            cx.actions.push(go);
+            ui.close();
+        }
+    }
     match t.source {
         Source::Spotify => {
             if let Some(id) = t.id.strip_prefix("spotify:track:") {
@@ -1425,6 +1831,8 @@ mod tests {
     #[test]
     fn songs_copy_as_links() {
         let mut t = Track {
+            album_artist: String::new(),
+            disc_no: None,
             id: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".into(),
             source: Source::Spotify,
             title: "Song".into(),
@@ -1437,6 +1845,15 @@ mod tests {
             added_at: 0,
         };
         assert_eq!(song_link(&t), "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC");
+        assert_eq!(
+            page_link("spotify:album:1").as_deref(),
+            Some("https://open.spotify.com/album/1")
+        );
+        assert_eq!(
+            page_link("https://soundcloud.com/a/sets/b").as_deref(),
+            Some("https://soundcloud.com/a/sets/b")
+        );
+        assert_eq!(page_link("local:artist:x"), None);
         t.source = Source::SoundCloud;
         t.uri = "https://soundcloud.com/a/b".into();
         assert_eq!(song_link(&t), "https://soundcloud.com/a/b");

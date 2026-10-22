@@ -38,6 +38,7 @@ It's written in Rust with [egui](https://github.com/emilk/egui), like [Spotifast
 - **Your Last.fm profile**: once your account is connected, your profile picture and name sit at the bottom of the sidebar (click them for your stats; the gear next to them opens Settings), and Home ends with your week on Last.fm. The profile page shows your scrobbles, artists, albums, tracks and daily average, a **listening chart** (the last 7 or 30 days by day, the last 12 months by month, or every year since you joined), your **top artists, albums and tracks**, your **top genres** (from the tags on your top artists) and your **recent scrobbles**, including what's playing now and loved songs. Each section has its own menu: **Today, the last 7 or 30 days, 3, 6 or 12 months, or all time** (Last.fm has no "today", so Sumo counts the day's scrobbles itself). Click an artist to open them in your library (or search for them), and an album or song to search for it. The stats come from Last.fm with your API key; a profile with a private listening history can't be shown.
 - **MPRIS / media keys**: works with `playerctl`, waybar, polybar, KDE/GNOME media widgets and headset buttons.
 - **Its own look**: graphite and off-white like the record logo, rounded "tile" panels, a floating player dock, header cards that glow in the colours of the cover, and soft hover and page transitions. **Drag the edges** of the sidebar and the lyrics / queue panel to resize them (sizes are remembered); drag the sidebar narrow and it becomes a strip of icons and covers. Also: a queue, back / forward navigation, albums and artists grids, gapless playback, ReplayGain, session restore, and drag and drop (drop a folder, `.m3u` or `Library.xml` onto the window). The accent colour can be changed in Settings.
+- **Queue and more**: the queue shows *Queued by you* apart from *Next from <playlist>*; drag songs to reorder them, and clear either part. In a narrow window the queue and lyrics open over the page. A **sleep timer** (the moon in the player) pauses after 15 minutes to 1½ hours, or after the current song. Home shows your **most played** songs and **recently added** albums. Albums with an album artist (compilations) stay together, multi-disc albums play disc by disc, and the Albums page sorts by artist, title or date added. The window opens at the size you left it, and starting Sumo again brings the running one to the front. On Linux, Sumo can show a desktop notification when a song starts (Settings → Appearance).
 - **Low memory use**: cover art is decoded at the size it's drawn and kept in a small LRU cache, fonts are memory-mapped from your system, and only two runtime threads are used. The window doesn't redraw at all while nothing changes.
 
 ## Install on Windows or macOS
@@ -131,9 +132,14 @@ Everything is under **Settings** (bottom of the sidebar).
 | `Ctrl+A` / `Ctrl+C` | Select every song in a list / copy the selected songs |
 | `Ctrl+V` | Paste copied songs (or Spotify / SoundCloud links, or music files) into the open playlist |
 | `Ctrl+X` / `Delete` | Cut / remove the selected songs from your playlist |
+| `M` | Mute / unmute |
+| `S` / `R` | Shuffle on or off / repeat all, one, off |
+| `H` | Like the playing song |
+| `Ctrl++` / `Ctrl+−` / `Ctrl+0` | Bigger / smaller / normal interface (remembered) |
+| `?` | Show every shortcut |
 | `Ctrl+Q` | Quit |
 
-Double-click a song to play it. Ctrl-click or Shift-click songs to select several. Click an artist name to open the artist. Right-click a song for *Play next*, *Add to queue*, *Add to playlist*, *Like* and *Open in Spotify / Show in folder*. Drag the sidebar or the right panel by its edge to resize it; drag the sidebar narrow (or click the logo) for the compact icons-and-covers strip.
+Double-click a song to play it. Ctrl-click or Shift-click songs to select several. Click an artist name to open the artist. Right-click a song for *Play next*, *Add to queue*, *Add to playlist*, *Like*, *Go to artist / album* and *Open in Spotify / Show in folder*; right-click an album, artist or search result for its own menu. Click a column name (*Title*, *Album*, the clock) to sort a list, or `#` for every way to sort (artist, recently added, …). In your own playlists, drag songs to move them. Scroll the mouse wheel over the volume to change it, and hover the seek bar to see the time under the pointer. Drag the sidebar or the right panel by its edge to resize it; drag the sidebar narrow (or click the logo) for the compact icons-and-covers strip.
 
 ## Memory use
 

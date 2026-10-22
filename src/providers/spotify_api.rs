@@ -681,6 +681,8 @@ pub fn parse_track(v: &Value, added_at: Option<&str>) -> Option<Track> {
         .unwrap_or_default();
 
     Some(Track {
+        album_artist: String::new(),
+        disc_no: None,
         id: uri.clone(),
         source: Source::Spotify,
         title: str_field(v, "name"),
@@ -1177,6 +1179,8 @@ mod tests {
 
     fn expected_track(added_at: i64) -> Track {
         Track {
+            album_artist: String::new(),
+            disc_no: None,
             id: "spotify:track:69kOkLUCkxIZYexIgSG8rq".into(),
             source: Source::Spotify,
             title: "Get Lucky (feat. Pharrell Williams and Nile Rodgers)".into(),

@@ -55,9 +55,14 @@ fn main() -> anyhow::Result<()> {
         default_hook(info);
     }));
 
-    // Windows: starting Sumo again brings the running one to the front.
+    // Starting Sumo again brings the running one to the front.
     #[cfg(windows)]
     if instance::running_elsewhere() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if instance::running_elsewhere(&paths) {
+        tracing::info!("Sumo is already running: showing that one");
         return Ok(());
     }
 
@@ -75,13 +80,23 @@ fn main() -> anyhow::Result<()> {
     let (cmd, service) = service::start(rt.handle().clone(), shared.clone(), paths.clone(), cfg.clone());
     #[cfg(windows)]
     instance::listen(rt.handle(), cmd.clone());
+    #[cfg(unix)]
+    instance::listen(rt.handle(), &paths, cmd.clone());
 
+    // The window opens as big as it was left (where is up to the system, which knows the
+    // screens there are now).
+    let size = cfg
+        .ui
+        .window_size
+        .filter(|[w, h]| w.is_finite() && h.is_finite())
+        .map_or([1280.0, 820.0], |[w, h]| [w.max(880.0), h.max(560.0)]);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Sumo")
             .with_app_id("multimusic")
-            .with_inner_size([1280.0, 820.0])
+            .with_inner_size(size)
             .with_min_inner_size([880.0, 560.0])
+            .with_maximized(cfg.ui.maximized)
             .with_icon(Arc::new(app_icon())),
         multisampling: 0,
         depth_buffer: 0,
@@ -188,6 +203,57 @@ mod instance {
                 Err(_) => return,
             }
         }
+    }
+}
+
+/// One Sumo at a time on Linux and macOS too: a second start asks the first to show itself,
+/// through a socket in the user's own runtime folder.
+#[cfg(unix)]
+mod instance {
+    use std::path::PathBuf;
+
+    use tokio::sync::mpsc::UnboundedSender;
+
+    use crate::config::Paths;
+    use crate::service::Command;
+
+    fn socket(paths: &Paths) -> PathBuf {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|d| d.is_dir())
+            .unwrap_or_else(|| paths.data_dir.clone())
+            .join("sumo.sock")
+    }
+
+    /// True when another Sumo runs (it was asked to come to the front).
+    pub fn running_elsewhere(paths: &Paths) -> bool {
+        use std::io::Write;
+        match std::os::unix::net::UnixStream::connect(socket(paths)) {
+            Ok(mut stream) => {
+                let _ = stream.write_all(b"raise\n");
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub fn listen(rt: &tokio::runtime::Handle, paths: &Paths, commands: UnboundedSender<Command>) {
+        let _guard = rt.enter();
+        let path = socket(paths);
+        // Left behind by a Sumo that didn't close properly: nothing answered on it.
+        let _ = std::fs::remove_file(&path);
+        let listener = match tokio::net::UnixListener::bind(&path) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!("can't listen on {}: {e}", path.display());
+                return;
+            }
+        };
+        rt.spawn(async move {
+            while let Ok((_stream, _)) = listener.accept().await {
+                let _ = commands.send(Command::Raise);
+            }
+        });
     }
 }
 

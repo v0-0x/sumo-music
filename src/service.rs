@@ -49,12 +49,31 @@ pub enum Command {
     SetVolume(f32),
     SetShuffle(bool),
     CycleRepeat,
+    /// Plays (or with `queue`, queues) songs known only by artist and title, like Last.fm's
+    /// top tracks: the library's file when there is one, else the match on Spotify or
+    /// SoundCloud.
+    PlayNamed {
+        songs: Vec<(String, String)>,
+        context: String,
+        queue: bool,
+    },
+    /// Pauses after a while, or when the playing song ends; `None` turns it off.
+    SetSleep(Option<SleepTimer>),
     Enqueue(Vec<Track>),
     PlayNext(Vec<Track>),
     /// Entry of the upcoming list and the song shown there (in case the queue moved on).
     JumpTo(usize, String),
     RemoveUpcoming(usize, String),
+    /// Song at entry `from` of the upcoming list (with its id) to entry `to`.
+    MoveUpcoming {
+        from: usize,
+        to: usize,
+        id: String,
+    },
+    /// Clears the rest of the playlist; the songs you queued stay.
     ClearUpcoming,
+    /// Clears the songs you queued.
+    ClearQueued,
     ToggleLike(Track),
     CreatePlaylist {
         name: String,
@@ -66,6 +85,17 @@ pub enum Command {
     },
     /// Removes rows of a playlist: each one's position and song (the song wins when the
     /// position no longer holds it).
+    /// Drag and drop in a playlist: the songs at `rows` (index, id) go before position `to`.
+    MovePlaylistTracks {
+        playlist_id: String,
+        rows: Vec<(usize, String)>,
+        to: usize,
+    },
+    /// Saves songs to Liked Songs (`liked`) or removes them.
+    SetLiked {
+        tracks: Vec<Track>,
+        liked: bool,
+    },
     RemoveFromPlaylist {
         playlist_id: String,
         rows: Vec<(usize, String)>,
@@ -162,6 +192,21 @@ pub enum Command {
     Quit,
 }
 
+/// When the sleep timer pauses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepTimer {
+    Minutes(u32),
+    EndOfSong,
+}
+
+/// The sleep timer as it runs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Sleep {
+    At(Instant),
+    /// When this many songs have started (the next one after the one playing).
+    AfterSong(u64),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PlayStatus {
     #[default]
@@ -191,6 +236,7 @@ pub struct PlayerView {
     pub context_first: Option<String>,
     /// Format of what's playing (codec, bit depth, sample rate).
     pub quality: Option<AudioQuality>,
+    pub sleep: Option<Sleep>,
 }
 
 impl Default for PlayerView {
@@ -210,6 +256,7 @@ impl Default for PlayerView {
             context: String::new(),
             context_first: None,
             quality: None,
+            sleep: None,
         }
     }
 }
@@ -449,6 +496,13 @@ impl Shared {
 
 /// Results of background jobs, sent back into the service loop.
 enum Internal {
+    /// Songs found for [`Command::PlayNamed`], in order; `missing` weren't found.
+    NamedFound {
+        tracks: Vec<Track>,
+        missing: usize,
+        context: String,
+        queue: bool,
+    },
     StreamReady {
         seq: u64,
         track: Track,
@@ -571,7 +625,7 @@ struct SoundCloudSync {
 const GITHUB_API: &str = "https://api.github.com";
 
 /// Bumped when the scanner learns to read more from files, so the library is read once again.
-const SCAN_VERSION: &str = "2";
+const SCAN_VERSION: &str = "3";
 
 /// How often crossfade timing is checked and volumes are stepped.
 const FADE_STEP: Duration = Duration::from_millis(50);
@@ -681,6 +735,9 @@ pub struct Service {
     consecutive_failures: u32,
     /// Pause was pressed while the song was loading: it starts paused.
     pause_wanted: bool,
+    sleep: Option<Sleep>,
+    /// Songs started so far (repeats too).
+    songs_started: u64,
     /// The queue changed and the saved session is behind.
     session_dirty: bool,
     /// When the playback position was last saved.
@@ -837,6 +894,8 @@ impl Service {
             started_reported: false,
             resume_position: None,
             pause_wanted: false,
+            sleep: None,
+            songs_started: 0,
             session_dirty: false,
             position_saved_at: Instant::now(),
             resumed_scrobbled: None,
@@ -914,6 +973,9 @@ impl Service {
                 _ = tick.tick() => self.on_tick().await,
                 _ = fade_tick.tick(), if fade_active => self.on_fade_tick().await,
             }
+            if self.sleep.is_some() {
+                self.check_sleep().await;
+            }
         }
         self.shutdown().await;
     }
@@ -986,6 +1048,23 @@ impl Service {
     // ---------------------------------------------------------------- commands
 
     async fn handle(&mut self, cmd: Command) {
+        // Picking another song moves "after this song" to it.
+        let picks_song = matches!(
+            cmd,
+            Command::Play { .. } | Command::Next | Command::Previous | Command::JumpTo(..)
+        );
+        self.handle_command(cmd).await;
+        if picks_song && matches!(self.sleep, Some(Sleep::AfterSong(_))) {
+            self.sleep = Some(Sleep::AfterSong(self.end_of_song()));
+        }
+    }
+
+    /// The count of started songs at which the one playing (or loading) has ended.
+    fn end_of_song(&self) -> u64 {
+        self.songs_started + 1 + u64::from(!self.started_reported)
+    }
+
+    async fn handle_command(&mut self, cmd: Command) {
         match cmd {
             Command::Play { tracks, start, context } => {
                 self.resume_position = None;
@@ -1051,6 +1130,25 @@ impl Service {
                 self.queue.repeat = self.queue.repeat.cycle();
                 self.after_queue_change().await;
             }
+            Command::PlayNamed { songs, context, queue } => self.play_named(songs, context, queue),
+            Command::SetSleep(timer) => {
+                self.sleep = match timer {
+                    Some(SleepTimer::Minutes(m)) => {
+                        Some(Sleep::At(Instant::now() + Duration::from_secs(60 * u64::from(m))))
+                    }
+                    Some(SleepTimer::EndOfSong) => self.queue.current().map(|_| Sleep::AfterSong(self.end_of_song())),
+                    None => None,
+                };
+                match timer {
+                    Some(SleepTimer::Minutes(m)) => self.shared.info(format!("Pausing in {m} minutes")),
+                    Some(SleepTimer::EndOfSong) if self.sleep.is_some() => {
+                        self.shared.info("Pausing after this song".to_string())
+                    }
+                    Some(SleepTimer::EndOfSong) => {}
+                    None => self.shared.info("Sleep timer off".to_string()),
+                }
+                self.publish_player();
+            }
             Command::Enqueue(tracks) => {
                 let n = tracks.len();
                 if self.queue.is_empty() {
@@ -1092,7 +1190,16 @@ impl Service {
                 self.queue.clear_upcoming();
                 self.after_queue_change().await;
             }
+            Command::ClearQueued => {
+                self.queue.clear_queued();
+                self.after_queue_change().await;
+            }
+            Command::MoveUpcoming { from, to, id } => {
+                self.queue.move_upcoming(from, to, &id);
+                self.after_queue_change().await;
+            }
             Command::ToggleLike(track) => self.toggle_like(track),
+            Command::SetLiked { tracks, liked } => self.set_liked(tracks, liked),
             Command::CreatePlaylist { name, tracks } => {
                 let id = format!("custom:{:x}{:04x}", now_unix(), rand::random::<u16>());
                 let p = Playlist {
@@ -1110,6 +1217,18 @@ impl Service {
             }
             Command::AddToPlaylist { playlist_id, tracks } => self.add_to_playlist(&playlist_id, &tracks),
             Command::AddLinksToPlaylist { playlist_id, links } => self.add_links_to_playlist(playlist_id, links),
+            Command::MovePlaylistTracks { playlist_id, rows, to } => {
+                let updated = {
+                    let mut lib = self.shared.library.write().unwrap();
+                    lib.playlist_mut(&playlist_id).map(|p| {
+                        library::move_rows(&mut p.track_ids, &rows, to);
+                        p.clone()
+                    })
+                };
+                if let Some(p) = updated {
+                    self.save_playlists(vec![p], &[]);
+                }
+            }
             Command::RemoveFromPlaylist { playlist_id, mut rows } => {
                 let updated = {
                     let mut lib = self.shared.library.write().unwrap();
@@ -1603,6 +1722,7 @@ impl Service {
             return;
         }
         self.started_reported = true;
+        self.songs_started += 1;
         self.consecutive_failures = 0;
         if self.fade_in == Some(FadeIn::Waiting) {
             self.start_fade_ramps();
@@ -1614,11 +1734,20 @@ impl Service {
         let now = now_unix();
         // The song from last time, picked up where it stopped: already counted and scrobbled.
         let resumed = self.resumed_scrobbled.take().is_some_and(|id| id == track.id);
-        if !resumed {
-            let _ = self.db.record_play(&track.id, now);
+        if self.cfg.ui.notifications && !resumed {
+            crate::integrations::notify::song(&track.title, &track.artist, &track.album);
         }
+        let most_played = if resumed {
+            None
+        } else {
+            let _ = self.db.record_play(&track.id, now);
+            self.db.top_plays(library::MOST_PLAYED).ok()
+        };
         {
             let mut lib = self.shared.library.write().unwrap();
+            if let Some(top) = most_played {
+                lib.most_played = top;
+            }
             lib.recent.retain(|id| id != &track.id);
             lib.recent.insert(0, track.id.clone());
             lib.recent.truncate(50);
@@ -2056,6 +2185,70 @@ impl Service {
         uri.is_empty() || self.playing.as_ref().is_some_and(|t| t.uri == uri)
     }
 
+    fn play_named(&mut self, songs: Vec<(String, String)>, context: String, queue: bool) {
+        use futures_util::StreamExt;
+        if songs.is_empty() {
+            return;
+        }
+        // Files in the library first; the rest is looked up, a few at a time.
+        let wanted: Vec<(Track, Option<Track>)> = {
+            let lib = self.shared.library.read().unwrap();
+            songs
+                .into_iter()
+                .map(|(artist, title)| {
+                    let local = lib.local_match(&artist, &title).cloned();
+                    (named_track(&artist, &title), local)
+                })
+                .collect()
+        };
+        let lookups = wanted.iter().filter(|(_, local)| local.is_none()).count();
+        if lookups > 0 {
+            self.shared.info(format!("Finding {}…", songs_text(lookups)));
+        }
+        let resolver = Arc::new(self.resolver());
+        let tx = self.internal_tx.clone();
+        tokio::spawn(async move {
+            let found: Vec<Option<Track>> = futures_util::stream::iter(wanted)
+                .map(|(want, local)| {
+                    let resolver = resolver.clone();
+                    async move {
+                        match local {
+                            Some(t) => Some(t),
+                            None => resolver.resolve(&want).await,
+                        }
+                    }
+                })
+                .buffered(4)
+                .collect()
+                .await;
+            let missing = found.iter().filter(|f| f.is_none()).count();
+            let _ = tx.send(Internal::NamedFound {
+                tracks: found.into_iter().flatten().collect(),
+                missing,
+                context,
+                queue,
+            });
+        });
+    }
+
+    /// Pauses once the sleep timer runs out: its time is up, or the song it waited for ended.
+    async fn check_sleep(&mut self) {
+        let due = match &self.sleep {
+            None => return,
+            Some(Sleep::At(at)) => Instant::now() >= *at,
+            Some(Sleep::AfterSong(at)) => self.songs_started >= *at || self.status == PlayStatus::Stopped,
+        };
+        if !due {
+            return;
+        }
+        self.sleep = None;
+        if matches!(self.status, PlayStatus::Playing | PlayStatus::Loading) {
+            self.pause().await;
+            self.shared.info("Sleep timer: paused".to_string());
+        }
+        self.publish_player();
+    }
+
     async fn on_tick(&mut self) {
         let dt = self.last_tick.elapsed();
         self.last_tick = Instant::now();
@@ -2360,6 +2553,7 @@ impl Service {
             pv.context = self.queue.context_name.clone();
             pv.context_first = self.queue.context_first().map(|t| t.id.clone());
             pv.quality = self.quality.clone();
+            pv.sleep = self.sleep.clone();
         }
         self.mpris.update(
             self.queue.current(),
@@ -2592,58 +2786,106 @@ impl Service {
     }
 
     fn toggle_like(&mut self, track: Track) {
-        self.store_tracks(std::slice::from_ref(&track));
-        let (liked_now, playlist) = {
+        let liked = {
+            let lib = self.shared.library.read().unwrap();
+            lib.playlist(LIKED_ID).is_some_and(|p| p.track_ids.contains(&track.id))
+        };
+        self.set_liked(vec![track], !liked);
+    }
+
+    /// Saves songs to Liked Songs (or removes them), on Spotify and Last.fm too.
+    fn set_liked(&mut self, tracks: Vec<Track>, liked: bool) {
+        self.store_tracks(&tracks);
+        let (changed, playlist) = {
             let mut lib = self.shared.library.write().unwrap();
             if lib.playlist(LIKED_ID).is_none() {
                 lib.playlists.insert(0, liked_playlist());
             }
             let p = lib.playlist_mut(LIKED_ID).expect("liked playlist");
-            let liked_now = if let Some(i) = p.track_ids.iter().position(|id| id == &track.id) {
-                p.track_ids.remove(i);
-                false
-            } else {
-                p.track_ids.insert(0, track.id.clone());
-                true
-            };
-            (liked_now, p.clone())
+            let mut changed: Vec<Track> = Vec::new();
+            for t in tracks {
+                let at = p.track_ids.iter().position(|id| id == &t.id);
+                let new = !changed.iter().any(|c| c.id == t.id);
+                match at {
+                    Some(i) if !liked => {
+                        p.track_ids.remove(i);
+                        changed.push(t);
+                    }
+                    None if liked && new => changed.push(t),
+                    _ => {}
+                }
+            }
+            if liked {
+                // The newest likes come first, in the order they were picked.
+                p.track_ids.splice(0..0, changed.iter().map(|t| t.id.clone()));
+            }
+            (changed, p.clone())
         };
+        if changed.is_empty() {
+            return;
+        }
         self.save_playlists(vec![playlist], &[]);
+        if changed.len() > 1 {
+            let n = songs_text(changed.len());
+            self.shared.info(if liked {
+                format!("Saved {n} to Liked Songs")
+            } else {
+                format!("Removed {n} from Liked Songs")
+            });
+        }
 
-        if let (Source::Spotify, Some(auth)) = (track.source, self.user_web_auth()) {
+        let spotify: Vec<Track> = changed
+            .iter()
+            .filter(|t| t.source == Source::Spotify)
+            .cloned()
+            .collect();
+        if let (false, Some(auth)) = (spotify.is_empty(), self.user_web_auth()) {
             let api = self.spotify_api.clone();
-            let t = track.clone();
             let shared = self.shared.clone();
             tokio::spawn(async move {
-                let result = match auth.token().await {
-                    Ok(token) => api.set_liked(&token, &t.uri, liked_now).await,
-                    Err(e) => Err(e),
-                };
-                if let Err(e) = result {
-                    tracing::warn!("Spotify like sync failed: {e:#}");
-                    shared.error(format!(
-                        "Couldn't {} “{}” on Spotify: {e:#}",
-                        if liked_now { "like" } else { "unlike" },
-                        t.title
-                    ));
+                let mut failed = Vec::new();
+                for t in &spotify {
+                    let result = match auth.token().await {
+                        Ok(token) => api.set_liked(&token, &t.uri, liked).await,
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = result {
+                        tracing::warn!("Spotify like sync failed: {e:#}");
+                        failed.push((t.title.clone(), e));
+                    }
+                }
+                let verb = if liked { "like" } else { "unlike" };
+                match failed.as_slice() {
+                    [] => {}
+                    [(title, e)] => shared.error(format!("Couldn't {verb} “{title}” on Spotify: {e:#}")),
+                    [(_, e), ..] => shared.error(format!(
+                        "Couldn't {verb} {} on Spotify: {e:#}",
+                        songs_text(failed.len())
+                    )),
                 }
             });
         }
         // Loved on Last.fm too when logged in there (songs without an artist can't be).
+        let lastfm: Vec<Track> = changed.into_iter().filter(|t| !t.artist.trim().is_empty()).collect();
         if let Some(lfm) = self
             .lastfm
             .clone()
-            .filter(|l| l.is_authenticated() && !track.artist.trim().is_empty())
+            .filter(|l| l.is_authenticated() && !lastfm.is_empty())
         {
             let shared = self.shared.clone();
             tokio::spawn(async move {
-                if let Err(e) = lfm.love(&track, liked_now).await {
-                    tracing::warn!("Last.fm love failed: {e:#}");
-                    shared.error(format!(
-                        "Couldn't {} “{}” on Last.fm",
-                        if liked_now { "love" } else { "unlove" },
-                        track.title
-                    ));
+                let mut failed = Vec::new();
+                for t in &lastfm {
+                    if let Err(e) = lfm.love(t, liked).await {
+                        tracing::warn!("Last.fm love failed: {e:#}");
+                        failed.push(t.title.clone());
+                    }
+                }
+                let verb = if liked { "love" } else { "unlove" };
+                match failed.as_slice() {
+                    [] => {}
+                    [title] => shared.error(format!("Couldn't {verb} “{title}” on Last.fm")),
+                    _ => shared.error(format!("Couldn't {verb} {} on Last.fm", songs_text(failed.len()))),
                 }
             });
         }
@@ -3450,16 +3692,35 @@ impl Service {
         let updated = {
             let mut lib = self.shared.library.write().unwrap();
             lib.playlist_mut(playlist_id).map(|p| {
-                p.track_ids.extend(tracks.iter().map(|t| t.id.clone()));
+                // Songs already in the playlist aren't added twice.
+                let mut have: HashSet<&str> = p.track_ids.iter().map(String::as_str).collect();
+                let new: Vec<String> = tracks
+                    .iter()
+                    .filter(|t| have.insert(t.id.as_str()))
+                    .map(|t| t.id.clone())
+                    .collect();
+                let skipped = tracks.len() - new.len();
+                p.track_ids.extend(new);
                 if p.art.is_none() {
                     p.art = tracks.iter().find_map(|t| t.art.clone());
                 }
-                p.clone()
+                (p.clone(), skipped)
             })
         };
-        if let Some(p) = updated {
-            self.shared
-                .info(format!("Added {} to “{}”", songs_text(tracks.len()), p.name));
+        let Some((p, skipped)) = updated else { return };
+        let added = tracks.len() - skipped;
+        self.shared.info(match (added, skipped) {
+            (_, 0) => format!("Added {} to “{}”", songs_text(added), p.name),
+            (0, 1) => format!("“{}” is already in “{}”", tracks[0].title, p.name),
+            (0, _) => format!("These songs are already in “{}”", p.name),
+            _ => format!(
+                "Added {} to “{}” ({} already in it)",
+                songs_text(added),
+                p.name,
+                songs_text(skipped)
+            ),
+        });
+        if added > 0 {
             self.save_playlists(vec![p], &[]);
         }
     }
@@ -4401,6 +4662,34 @@ impl Service {
 
     async fn on_internal(&mut self, msg: Internal) {
         match msg {
+            Internal::NamedFound {
+                tracks,
+                missing,
+                context,
+                queue,
+            } => {
+                if missing > 0 {
+                    self.shared.error(format!(
+                        "Couldn't find {} of {} on your services",
+                        songs_text(missing),
+                        songs_text(missing + tracks.len())
+                    ));
+                }
+                if tracks.is_empty() {
+                    return;
+                }
+                self.store_tracks(&tracks);
+                let cmd = if queue {
+                    Command::Enqueue(tracks)
+                } else {
+                    Command::Play {
+                        tracks,
+                        start: 0,
+                        context,
+                    }
+                };
+                Box::pin(self.handle(cmd)).await;
+            }
             Internal::StreamReady { seq, track, url } => {
                 if seq == self.load_seq {
                     let start = self.position;
@@ -5655,6 +5944,24 @@ fn friendly_spotify_error(e: &anyhow::Error) -> String {
     }
 }
 
+/// A song known only by name, to look up.
+fn named_track(artist: &str, title: &str) -> Track {
+    Track {
+        id: format!("named:{artist}\u{1f}{title}"),
+        source: Source::AppleMusic,
+        title: title.to_string(),
+        artist: artist.to_string(),
+        album: String::new(),
+        album_artist: String::new(),
+        duration_ms: 0,
+        track_no: None,
+        disc_no: None,
+        art: None,
+        uri: String::new(),
+        added_at: 0,
+    }
+}
+
 /// Finds a playable version of an imported (Apple Music) song on Spotify or SoundCloud.
 struct Resolver {
     spotify: Option<(Arc<SpotifyAuth>, Arc<SpotifyApi>)>,
@@ -5919,6 +6226,8 @@ mod tests {
 
     fn track(source: Source, artist: &str, title: &str, dur: u64) -> Track {
         Track {
+            album_artist: String::new(),
+            disc_no: None,
             id: format!("{}:{artist}{title}", source.as_str()),
             source,
             title: title.into(),

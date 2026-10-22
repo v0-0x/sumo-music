@@ -490,6 +490,8 @@ fn convert_track(uri: &str, t: &metadata::Track) -> Option<Track> {
             .map(|i| image_url(i.file_id()))
     });
     Some(Track {
+        album_artist: String::new(),
+        disc_no: None,
         id: uri.to_string(),
         source: Source::Spotify,
         title: t.name().to_string(),

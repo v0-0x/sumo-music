@@ -9,7 +9,7 @@ use super::{Action, Cx, RightTab, View};
 use crate::library::LIKED_ID;
 use crate::links;
 use crate::model::{PlaylistKind, RepeatMode, Source, Track};
-use crate::service::{Command, PlayStatus};
+use crate::service::{Command, PlayStatus, Sleep, SleepTimer};
 
 /// Space around the panels.
 pub const GAP: f32 = 12.0;
@@ -101,23 +101,22 @@ pub fn sidebar(ui: &mut Ui, cx: &mut Cx, st: &mut SidebarState, size: SidebarSiz
                 st.view,
                 st.collapsed,
             );
-            if !cx.feed.downloads.is_empty() || !cx.feed.downloaded.is_empty() {
-                let left = cx.feed.downloads.iter().filter(|d| d.state.active()).count();
-                let label = if left > 0 {
-                    format!("Downloads · {left}")
-                } else {
-                    "Downloads".to_string()
-                };
-                nav_item(
-                    ui,
-                    cx,
-                    icon::DOWNLOAD_SIMPLE,
-                    &label,
-                    View::Downloads,
-                    st.view,
-                    st.collapsed,
-                );
-            }
+            // Always there, so it can be found before the first download.
+            let left = cx.feed.downloads.iter().filter(|d| d.state.active()).count();
+            let label = if left > 0 {
+                format!("Downloads · {left}")
+            } else {
+                "Downloads".to_string()
+            };
+            nav_item(
+                ui,
+                cx,
+                icon::DOWNLOAD_SIMPLE,
+                &label,
+                View::Downloads,
+                st.view,
+                st.collapsed,
+            );
             ui.add_space(10.0);
             playlists_header(ui, cx, st.collapsed);
             if let Some((done, total)) = cx.feed.scan {
@@ -752,22 +751,38 @@ pub fn player_dock(ui: &mut Ui, cx: &mut Cx, right: Option<RightTab>) {
             )
             .clicked()
             {
-                let muted: Option<f32> = ui.data(|d| d.get_temp(Id::new("pre-mute")));
-                if vol > 0.5 {
-                    ui.data_mut(|d| d.insert_temp(Id::new("pre-mute"), vol));
-                    cx.actions.push(Action::Cmd(Command::SetVolume(0.0)));
-                } else {
-                    cx.actions.push(Action::Cmd(Command::SetVolume(muted.unwrap_or(70.0))));
+                cx.actions.push(Action::Cmd(mute_command(ui.ctx(), vol)));
+            }
+            // The mouse wheel over the volume turns it up or down.
+            let volume_area = vr.union(Rect::from_min_max(
+                Pos2::new(vr.right(), cy - 10.0),
+                Pos2::new(vr.right() + vol_w + 4.0, cy + 10.0),
+            ));
+            if ui.rect_contains_pointer(volume_area) {
+                // A wheel notch (a line) is 5%; touchpads scroll by points.
+                let scroll: f32 = ui.input(|i| {
+                    i.events
+                        .iter()
+                        .map(|e| match e {
+                            egui::Event::MouseWheel { unit, delta, .. } => match unit {
+                                egui::MouseWheelUnit::Line => delta.y * 5.0,
+                                egui::MouseWheelUnit::Point => delta.y * 0.1,
+                                egui::MouseWheelUnit::Page => delta.y * 20.0,
+                            },
+                            _ => 0.0,
+                        })
+                        .sum()
+                });
+                if scroll != 0.0 {
+                    let v = (vol + scroll).clamp(0.0, 100.0);
+                    cx.actions.push(Action::Cmd(Command::SetVolume(v)));
                 }
             }
-            let tabs: &[(RightTab, &str, &str)] = if compact {
-                &[]
-            } else {
-                &[
-                    (RightTab::Queue, icon::QUEUE, "Queue"),
-                    (RightTab::Lyrics, icon::MICROPHONE_STAGE, "Lyrics"),
-                ]
-            };
+            // At every width: a window too narrow for the panel shows it over the page.
+            let tabs: &[(RightTab, &str, &str)] = &[
+                (RightTab::Queue, icon::QUEUE, "Queue"),
+                (RightTab::Lyrics, icon::MICROPHONE_STAGE, "Lyrics"),
+            ];
             for &(tab, glyph, tip) in tabs {
                 if dock_button(
                     ui,
@@ -793,6 +808,9 @@ pub fn player_dock(ui: &mut Ui, cx: &mut Cx, right: Option<RightTab>) {
             .clicked()
             {
                 cx.actions.push(Action::Go(View::NowPlaying));
+            }
+            if !compact || cx.player.sleep.is_some() {
+                sleep_button(ui, cx, take_slot(&mut rx, cy, CONTROL));
             }
             rx -= 8.0;
             let (rep_icon, rep_on, rep_tip) = match cx.player.repeat {
@@ -843,6 +861,51 @@ pub fn player_dock(ui: &mut Ui, cx: &mut Cx, right: Option<RightTab>) {
             );
             now_playing(ui, cx, middle);
         });
+}
+
+/// The sleep timer: a moon that lights up while it runs, with a menu of times.
+fn sleep_button(ui: &mut Ui, cx: &mut Cx, rect: Rect) {
+    let on = cx.player.sleep.is_some();
+    let resp = dock_button(ui, rect, icon::MOON, Look::Toggle(on), cx.accent, "Sleep timer");
+    egui::Popup::menu(&resp).show(|ui| {
+        ui.set_min_width(190.0);
+        let status = match &cx.player.sleep {
+            Some(Sleep::At(at)) => {
+                let left = at.saturating_duration_since(std::time::Instant::now()).as_secs();
+                format!("Pauses in {}:{:02}", left / 60, left % 60)
+            }
+            Some(Sleep::AfterSong(_)) => "Pauses after this song".to_string(),
+            None => "Pause playback…".to_string(),
+        };
+        ui.label(egui::RichText::new(status).small().color(TEXT_FAINT));
+        let mut pick = |ui: &mut Ui, label: &str, timer: Option<SleepTimer>| {
+            if ui.button(label).clicked() {
+                cx.actions.push(Action::Cmd(Command::SetSleep(timer)));
+                ui.close();
+            }
+        };
+        for m in [15, 30, 45, 60, 90] {
+            let label = if m < 60 {
+                format!("In {m} minutes")
+            } else if m == 60 {
+                "In 1 hour".to_string()
+            } else {
+                "In 1½ hours".to_string()
+            };
+            pick(ui, &label, Some(SleepTimer::Minutes(m)));
+        }
+        pick(ui, "After this song", Some(SleepTimer::EndOfSong));
+        if on {
+            ui.separator();
+            pick(ui, "Turn off", None);
+        }
+    });
+    // While it counts down, the menu's time and the dot stay current.
+    if matches!(cx.player.sleep, Some(Sleep::At(_)))
+        && egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp))
+    {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+    }
 }
 
 /// The next control slot of width `w`, going left from `rx`.
@@ -1045,6 +1108,18 @@ fn now_playing(ui: &mut Ui, cx: &mut Cx, rect: Rect) {
         if let Some(f) = changed {
             ui.data_mut(|d| d.insert_temp(id, f));
         }
+        // Hovering shows the time under the pointer.
+        if let (Some(pos), true) = (resp.hover_pos(), dur > 0.0) {
+            let f = ((pos.x - bar.left()) / bar.width()).clamp(0.0, 1.0);
+            let text = theme::fmt_time(f as f64 * dur);
+            let painter = ui
+                .ctx()
+                .layer_painter(egui::LayerId::new(egui::Order::Tooltip, id.with("hover")));
+            let galley = painter.layout_no_wrap(text, theme::font(11.5), TEXT);
+            let at = Rect::from_center_size(Pos2::new(pos.x, bar.top() - 14.0), galley.size() + vec2(12.0, 6.0));
+            painter.rect_filled(at, CornerRadius::same(6), CARD);
+            painter.galley(at.center() - galley.size() / 2.0, galley, TEXT);
+        }
         if resp.drag_stopped() || resp.clicked() {
             if let Some(f) = ui.data(|d| d.get_temp::<f32>(id)) {
                 if dur > 0.0 {
@@ -1053,6 +1128,17 @@ fn now_playing(ui: &mut Ui, cx: &mut Cx, rect: Rect) {
             }
             ui.data_mut(|d| d.remove::<f32>(id));
         }
+    }
+}
+
+/// Mutes, or brings back the volume from before muting.
+pub fn mute_command(ctx: &egui::Context, volume: f32) -> Command {
+    let id = Id::new("pre-mute");
+    if volume > 0.5 {
+        ctx.data_mut(|d| d.insert_temp(id, volume));
+        Command::SetVolume(0.0)
+    } else {
+        Command::SetVolume(ctx.data(|d| d.get_temp(id)).unwrap_or(70.0))
     }
 }
 
@@ -1075,42 +1161,69 @@ pub fn right_panel(ui: &mut Ui, cx: &mut Cx, tab: RightTab, width: f32) -> f32 {
             top: GAP as i8,
             bottom: 0,
         }))
-        .show(ui, |ui| {
-            egui::Frame::new()
-                .fill(PANEL)
-                .corner_radius(CornerRadius::same(RADIUS))
-                .inner_margin(Margin::same(16))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.set_min_height(ui.available_height());
-                    ui.horizontal(|ui| {
-                        let options = [
-                            (RightTab::NowPlaying, "Playing"),
-                            (RightTab::Lyrics, "Lyrics"),
-                            (RightTab::Queue, "Queue"),
-                        ];
-                        if let Some(t) = widgets::segmented(ui, &options, tab) {
-                            if t != tab {
-                                cx.actions.push(Action::RightTab(t));
-                            }
-                        }
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if widgets::icon_button(ui, icon::X, 15.0, TEXT_DIM, "Close").clicked() {
-                                cx.actions.push(Action::ToggleRightPanel);
-                            }
-                        });
-                    });
-                    ui.add_space(14.0);
-                    match tab {
-                        RightTab::NowPlaying => now_playing_panel(ui, cx),
-                        RightTab::Lyrics => lyrics(ui, cx, false),
-                        RightTab::Queue => queue(ui, cx),
-                    }
-                });
-        })
+        .show(ui, |ui| right_panel_body(ui, cx, tab))
         .response
         .rect
         .width()
+}
+
+/// The right panel floating over the page, for windows too narrow to show it beside it.
+/// `area` is where it may go (right of the sidebar, above the player).
+pub fn right_overlay(ctx: &egui::Context, cx: &mut Cx, tab: RightTab, area: Rect) {
+    let width = RIGHT_MIN.max(area.width().min(360.0));
+    let rect = Rect::from_min_max(Pos2::new(area.right() - width, area.top()), area.max);
+    egui::Area::new(egui::Id::new("right-overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.min)
+        .show(ctx, |ui| {
+            ui.set_min_size(rect.size());
+            ui.set_max_size(rect.size());
+            ui.painter().add(
+                egui::Shadow {
+                    offset: [0, 6],
+                    blur: 28,
+                    spread: 0,
+                    color: Color32::from_black_alpha(140),
+                }
+                .as_shape(rect, CornerRadius::same(RADIUS)),
+            );
+            right_panel_body(ui, cx, tab);
+        });
+}
+
+/// The tabs (Playing, Lyrics, Queue) and what the chosen one shows.
+fn right_panel_body(ui: &mut Ui, cx: &mut Cx, tab: RightTab) {
+    egui::Frame::new()
+        .fill(PANEL)
+        .corner_radius(CornerRadius::same(RADIUS))
+        .inner_margin(Margin::same(16))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_min_height(ui.available_height());
+            ui.horizontal(|ui| {
+                let options = [
+                    (RightTab::NowPlaying, "Playing"),
+                    (RightTab::Lyrics, "Lyrics"),
+                    (RightTab::Queue, "Queue"),
+                ];
+                if let Some(t) = widgets::segmented(ui, &options, tab) {
+                    if t != tab {
+                        cx.actions.push(Action::RightTab(t));
+                    }
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if widgets::icon_button(ui, icon::X, 15.0, TEXT_DIM, "Close").clicked() {
+                        cx.actions.push(Action::ToggleRightPanel);
+                    }
+                });
+            });
+            ui.add_space(14.0);
+            match tab {
+                RightTab::NowPlaying => now_playing_panel(ui, cx),
+                RightTab::Lyrics => lyrics(ui, cx, false),
+                RightTab::Queue => queue(ui, cx),
+            }
+        });
 }
 
 fn now_playing_panel(ui: &mut Ui, cx: &mut Cx) {
@@ -1477,36 +1590,120 @@ fn queue(ui: &mut Ui, cx: &mut Cx) {
         empty_state(ui, icon::QUEUE, "Nothing queued");
         return;
     }
+    let n = upcoming.len();
+    let queued = cx.player.up_next_len.min(n);
+    let drag_id = Id::new("queue-drag");
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        // Songs you queued play first, then the rest of the playlist; each part has its own
+        // Clear, and songs can be dragged within their part.
+        let parts = [
+            (0..queued, "Queued by you".to_string(), Command::ClearQueued),
+            (
+                queued..n,
+                format!("Next from: {}", cx.player.context),
+                Command::ClearUpcoming,
+            ),
+        ];
+        let mut rows: Vec<(usize, Rect)> = Vec::with_capacity(n);
+        for (range, title, clear) in parts {
+            if range.is_empty() {
+                continue;
+            }
+            let count = range.len();
+            queue_part_header(ui, cx, &title, count, clear);
+            for i in range {
+                let t = cx.player.upcoming[i].clone();
+                let rect = queue_row(ui, cx, &t, Some(i), false);
+                rows.push((i, rect));
+            }
+            ui.add_space(10.0);
+        }
+        queue_drag(ui, cx, drag_id, &rows, queued);
+    });
+}
+
+/// "Queued by you" / "Next from …" with a Clear that asks first.
+fn queue_part_header(ui: &mut Ui, cx: &mut Cx, title: &str, count: usize, clear: Command) {
+    let confirm_id = Id::new(("queue-clear", title.starts_with("Queued")));
+    let asking: bool = ui.data(|d| d.get_temp(confirm_id)).unwrap_or(false);
     ui.horizontal(|ui| {
-        let label = if cx.player.up_next_len > 0 {
-            "Next up".to_string()
-        } else {
-            format!("Next from: {}", cx.player.context)
-        };
-        ui.label(egui::RichText::new(label).font(theme::bold_font(13.0)).color(TEXT_DIM));
+        ui.label(egui::RichText::new(title).font(theme::bold_font(13.0)).color(TEXT_DIM));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui
-                .add(egui::Label::new(egui::RichText::new("Clear").small().color(TEXT_FAINT)).sense(Sense::click()))
-                .clicked()
-            {
-                cx.actions.push(Action::Cmd(Command::ClearUpcoming));
+            let link = |ui: &mut Ui, text: &str, color: Color32| {
+                ui.add(egui::Label::new(egui::RichText::new(text).small().color(color)).sense(Sense::click()))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+            };
+            if asking {
+                if link(ui, "Keep", TEXT_DIM) {
+                    ui.data_mut(|d| d.insert_temp(confirm_id, false));
+                }
+                if link(ui, &format!("Remove {count}?"), theme::DANGER) {
+                    ui.data_mut(|d| d.insert_temp(confirm_id, false));
+                    cx.actions.push(Action::Cmd(clear));
+                }
+            } else if link(ui, "Clear", TEXT_FAINT) {
+                ui.data_mut(|d| d.insert_temp(confirm_id, true));
             }
         });
     });
     ui.add_space(4.0);
-    let n = upcoming.len();
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show_rows(ui, 52.0, n, |ui, range| {
-            for i in range {
-                let t = cx.player.upcoming[i].clone();
-                queue_row(ui, cx, &t, Some(i), false);
-            }
-        });
 }
 
-fn queue_row(ui: &mut Ui, cx: &mut Cx, t: &crate::model::Track, index: Option<usize>, current: bool) {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 52.0), Sense::click());
+/// Dragging a queue row moves it within its part (shown with a line where it will go).
+fn queue_drag(ui: &mut Ui, cx: &mut Cx, drag_id: Id, rows: &[(usize, Rect)], queued: usize) {
+    let Some(from) = ui.data(|d| d.get_temp::<usize>(drag_id)) else {
+        return;
+    };
+    // A drag that ended elsewhere (the panel was closed meanwhile) is over.
+    if !ui.input(|i| i.pointer.any_down() || i.pointer.any_released()) {
+        ui.data_mut(|d| d.remove::<usize>(drag_id));
+        return;
+    }
+    let Some(pointer) = ui.ctx().pointer_interact_pos() else {
+        return;
+    };
+    let same_part = |i: usize| (i < queued) == (from < queued);
+    // The row under the pointer in the same part decides the place.
+    let target = rows
+        .iter()
+        .filter(|(i, _)| same_part(*i))
+        .min_by(|(_, a), (_, b)| {
+            (a.center().y - pointer.y)
+                .abs()
+                .total_cmp(&(b.center().y - pointer.y).abs())
+        })
+        .copied();
+    let Some((to, rect)) = target else { return };
+    let y = if to > from { rect.bottom() } else { rect.top() };
+    ui.painter().hline(rect.x_range(), y, Stroke::new(2.0, cx.accent));
+    if ui.input(|i| i.pointer.any_released()) {
+        ui.data_mut(|d| d.remove::<usize>(drag_id));
+        if to != from {
+            if let Some(t) = cx.player.upcoming.get(from) {
+                cx.actions.push(Action::Cmd(Command::MoveUpcoming {
+                    from,
+                    to,
+                    id: t.id.clone(),
+                }));
+            }
+        }
+    }
+}
+
+fn queue_row(ui: &mut Ui, cx: &mut Cx, t: &crate::model::Track, index: Option<usize>, current: bool) -> Rect {
+    let sense = if index.is_some() {
+        Sense::click_and_drag()
+    } else {
+        Sense::click()
+    };
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 52.0), sense);
+    if let (Some(i), true) = (index, resp.drag_started()) {
+        ui.data_mut(|d| d.insert_temp(Id::new("queue-drag"), i));
+    }
+    if resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
     widgets::fade_fill(ui, resp.id, rect, 10, resp.hovered(), HOVER);
     let art = Rect::from_min_size(rect.min + vec2(4.0, 6.0), vec2(40.0, 40.0));
     let src = t.art.clone().or_else(|| {
@@ -1555,4 +1752,5 @@ fn queue_row(ui: &mut Ui, cx: &mut Cx, t: &crate::model::Track, index: Option<us
     }
     let track = t.clone();
     resp.context_menu(|ui| widgets::track_menu(ui, cx, &track, None));
+    rect
 }

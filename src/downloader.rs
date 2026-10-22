@@ -331,6 +331,8 @@ mod tests {
     #[test]
     fn basic_details_from_the_library() {
         let t = Track {
+            album_artist: String::new(),
+            disc_no: None,
             id: "spotify:track:abc".into(),
             source: Source::Spotify,
             title: "Song".into(),

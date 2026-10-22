@@ -869,6 +869,8 @@ mod tests {
 
     fn track(artist: &str, title: &str, album: &str, duration_ms: u64) -> Track {
         Track {
+            album_artist: String::new(),
+            disc_no: None,
             id: format!("spotify:track:{title}"),
             source: Source::Spotify,
             title: title.into(),

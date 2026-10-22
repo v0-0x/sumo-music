@@ -36,6 +36,8 @@ pub struct TagEditor {
     /// The Spotify lookup waited for.
     lookup: Option<u64>,
     note: Option<String>,
+    /// Closing was asked for with edits not saved: asks whether to drop them.
+    confirm_close: bool,
 }
 
 impl TagEditor {
@@ -64,6 +66,7 @@ impl TagEditor {
             cover_text: String::new(),
             lookup: None,
             note: None,
+            confirm_close: false,
         })
     }
 
@@ -167,6 +170,7 @@ impl TagEditor {
         // Read before the text fields, which take Enter for themselves.
         let save_key = ctx.input(|i| i.modifiers.command && i.key_pressed(Key::Enter));
         let mut open = true;
+        let mut cancel = false;
         let modal = egui::Modal::new(egui::Id::new("tag-editor")).show(ctx, |ui| {
             ui.set_width(580.0);
             let title = if self.several() {
@@ -199,25 +203,33 @@ impl TagEditor {
                 return;
             }
 
-            ui.horizontal_top(|ui| {
-                self.cover_box(ui, art, accent, out);
-                ui.add_space(12.0);
-                ui.vertical(|ui| self.fields(ui));
-            });
-            if !self.several() {
-                let i = Field::ALL.iter().position(|f| *f == Field::Lyrics).unwrap_or(0);
-                egui::CollapsingHeader::new("Lyrics")
-                    .id_salt("tag-editor-lyrics")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.values[i])
-                                .hint_text("Plain text, or LRC lines like [00:12.50] for synced lyrics")
-                                .desired_rows(6)
-                                .desired_width(f32::INFINITY),
-                        );
+            // Scrolls when the window (or a big interface scale) leaves too little room.
+            let room = (ctx.content_rect().height() - 260.0).max(160.0);
+            egui::ScrollArea::vertical()
+                .id_salt("tag-editor-scroll")
+                .max_height(room)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        self.cover_box(ui, art, accent, out);
+                        ui.add_space(12.0);
+                        ui.vertical(|ui| self.fields(ui));
                     });
-            }
+                    if !self.several() {
+                        let i = Field::ALL.iter().position(|f| *f == Field::Lyrics).unwrap_or(0);
+                        egui::CollapsingHeader::new("Lyrics")
+                            .id_salt("tag-editor-lyrics")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut self.values[i])
+                                        .hint_text("Plain text, or LRC lines like [00:12.50] for synced lyrics")
+                                        .desired_rows(6)
+                                        .desired_width(f32::INFINITY),
+                                );
+                            });
+                    }
+                });
             if let Some(note) = &self.note {
                 ui.label(RichText::new(note).small().color(TEXT_DIM));
             }
@@ -227,6 +239,19 @@ impl TagEditor {
             if let Some(p) = &problem {
                 ui.colored_label(theme::DANGER, p);
                 ui.add_space(4.0);
+            }
+            if self.confirm_close {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Discard your changes?").color(TEXT));
+                    ui.add_space(8.0);
+                    if widgets::pill(ui, "Discard", theme::DANGER, TEXT).clicked() {
+                        open = false;
+                    }
+                    if widgets::pill(ui, "Keep editing", CARD, TEXT).clicked() {
+                        self.confirm_close = false;
+                    }
+                });
+                return;
             }
             ui.horizontal(|ui| {
                 let save = widgets::pill(ui, "Save", accent, theme::on_color(accent))
@@ -249,14 +274,27 @@ impl TagEditor {
                     open = false;
                 }
                 if widgets::pill(ui, "Cancel", CARD, TEXT).clicked() {
-                    open = false;
+                    cancel = true;
                 }
             });
         });
-        if modal.should_close() {
-            open = false;
+        // Escape or a click beside the editor closes it too; edits not saved are asked about.
+        if cancel || modal.should_close() {
+            if self.confirm_close {
+                // Escape again: back to editing.
+                self.confirm_close = false;
+            } else if self.edited() && self.error.is_none() && self.reading.is_none() {
+                self.confirm_close = true;
+            } else {
+                open = false;
+            }
         }
         open
+    }
+
+    /// Whether anything was changed and not saved yet.
+    fn edited(&self) -> bool {
+        !self.changes().is_empty() || self.cover != Cover::Keep
     }
 
     fn fields(&mut self, ui: &mut egui::Ui) {
@@ -356,6 +394,22 @@ impl TagEditor {
                 if ui.add_enabled(!text.is_empty(), egui::Button::new("Use")).clicked() {
                     self.cover = Cover::From(text);
                 }
+                if ui.button("Browse…").clicked() {
+                    super::picker::open(
+                        ui.ctx(),
+                        "cover-file",
+                        "Cover image",
+                        super::picker::Pick::File("Images", &["jpg", "jpeg", "png", "webp"]),
+                    );
+                }
+                match super::picker::take(ui.ctx(), "cover-file") {
+                    Some(Ok(p)) => {
+                        self.cover_text = p.to_string_lossy().into_owned();
+                        self.cover = Cover::From(self.cover_text.clone());
+                    }
+                    Some(Err(e)) => self.note = Some(e),
+                    None => {}
+                }
                 if ui.button("Remove").clicked() {
                     self.cover = Cover::Remove;
                 }
@@ -414,6 +468,8 @@ mod tests {
 
     fn editor(n: usize) -> TagEditor {
         let track = |i: usize| Track {
+            album_artist: String::new(),
+            disc_no: None,
             id: format!("local:/m/{i}.mp3"),
             source: Source::Local,
             title: format!("Song {i}"),
@@ -435,11 +491,23 @@ mod tests {
             cover_text: String::new(),
             lookup: None,
             note: None,
+            confirm_close: false,
         }
     }
 
     fn at(f: Field) -> usize {
         Field::ALL.iter().position(|x| *x == f).unwrap()
+    }
+
+    #[test]
+    fn unsaved_edits_are_noticed() {
+        let mut e = editor(1);
+        assert!(!e.edited());
+        e.values[at(Field::Genre)] = "Rap".into();
+        assert!(e.edited());
+        let mut e = editor(1);
+        e.cover = Cover::Remove;
+        assert!(e.edited());
     }
 
     #[test]

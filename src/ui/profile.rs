@@ -617,6 +617,30 @@ fn top_section(ui: &mut Ui, cx: &mut Cx, kind: TopKind, period: &mut Period) {
         shown.min(list.items.len())
     };
     let items = &list.items[..n];
+    if kind == TopKind::Tracks {
+        // The whole list plays (or queues) by name: each song from the library or a service.
+        let named =
+            || -> Vec<(String, String)> { list.items.iter().map(|t| (t.artist.clone(), t.name.clone())).collect() };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let context = format!("Your top tracks {}", period.phrase());
+            if widgets::pill(ui, "Play all", cx.accent, theme::on_color(cx.accent)).clicked() {
+                cx.actions.push(Action::Cmd(Command::PlayNamed {
+                    songs: named(),
+                    context: context.clone(),
+                    queue: false,
+                }));
+            }
+            if widgets::pill(ui, "Add to queue", HOVER, TEXT).clicked() {
+                cx.actions.push(Action::Cmd(Command::PlayNamed {
+                    songs: named(),
+                    context,
+                    queue: true,
+                }));
+            }
+        });
+        ui.add_space(8.0);
+    }
     match kind {
         TopKind::Tracks => track_rows(ui, cx, items),
         _ => tiles(ui, cx, kind, items),
@@ -644,7 +668,26 @@ fn search_for(item: &TopItem) -> Action {
     Action::Search(format!("{} {}", item.artist, item.name).trim().to_string())
 }
 
-fn item_menu(ui: &mut Ui, cx: &mut Cx, item: &TopItem) {
+fn item_menu(ui: &mut Ui, cx: &mut Cx, item: &TopItem, song: bool) {
+    if song {
+        let named = vec![(item.artist.clone(), item.name.clone())];
+        if ui.button(theme::ic(icon::PLAY, "Play")).clicked() {
+            cx.actions.push(Action::Cmd(Command::PlayNamed {
+                songs: named.clone(),
+                context: "Last.fm".into(),
+                queue: false,
+            }));
+            ui.close();
+        }
+        if ui.button(theme::ic(icon::LIST_PLUS, "Add to queue")).clicked() {
+            cx.actions.push(Action::Cmd(Command::PlayNamed {
+                songs: named,
+                context: "Last.fm".into(),
+                queue: true,
+            }));
+            ui.close();
+        }
+    }
     if ui.button(theme::ic(icon::MAGNIFYING_GLASS, "Search in Sumo")).clicked() {
         cx.actions.push(if item.artist.is_empty() {
             Action::Search(item.name.clone())
@@ -719,7 +762,7 @@ fn tiles(ui: &mut Ui, cx: &mut Cx, kind: TopKind, items: &[TopItem]) {
                 _ => search_for(item),
             });
         }
-        resp.context_menu(|ui| item_menu(ui, cx, item));
+        resp.context_menu(|ui| item_menu(ui, cx, item, false));
     });
 }
 
@@ -800,7 +843,7 @@ fn track_rows(ui: &mut Ui, cx: &mut Cx, items: &[TopItem]) {
         if resp.clicked() && !artist.hovered() {
             cx.actions.push(search_for(item));
         }
-        resp.context_menu(|ui| item_menu(ui, cx, item));
+        resp.context_menu(|ui| item_menu(ui, cx, item, true));
     }
 }
 
@@ -1002,7 +1045,7 @@ fn recent_section(ui: &mut Ui, cx: &mut Cx) {
         if resp.clicked() {
             cx.actions.push(search_for(&item));
         }
-        resp.context_menu(|ui| item_menu(ui, cx, &item));
+        resp.context_menu(|ui| item_menu(ui, cx, &item, true));
     }
     if list.len() > 15 {
         let label = if all {

@@ -926,6 +926,8 @@ pub fn parse_track(v: &Value) -> Option<Track> {
     let uri = non_empty(v.get("permalink_url")).unwrap_or_default().to_owned();
 
     Some(Track {
+        album_artist: String::new(),
+        disc_no: None,
         id: Track::soundcloud_id(id),
         source: Source::SoundCloud,
         title,
@@ -1632,6 +1634,8 @@ mod tests {
         assert_eq!(
             t,
             Track {
+                album_artist: String::new(),
+                disc_no: None,
                 id: "soundcloud:293".into(),
                 source: Source::SoundCloud,
                 title: "Flickermood".into(),

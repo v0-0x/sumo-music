@@ -110,13 +110,19 @@ pub fn scan(folders: &[PathBuf], known: &HashMap<String, i64>, progress: &(dyn F
                     let mut out = Vec::with_capacity(part.len());
                     for (path, folder, mtime) in part {
                         let cover = path.parent().and_then(|dir| {
-                            let mut cache = cover_cache.lock().unwrap();
-                            cache
-                                .entry(dir.to_path_buf())
-                                .or_insert_with(|| find_cover(dir))
-                                .clone()
+                            // The folder is read without holding the cache, so the other
+                            // threads don't wait on it.
+                            let cached = cover_cache.lock().unwrap().get(dir).cloned();
+                            cached.unwrap_or_else(|| {
+                                let found = find_cover(dir);
+                                cover_cache.lock().unwrap().insert(dir.to_path_buf(), found.clone());
+                                found
+                            })
                         });
-                        out.push((read_track_in(path, Some(folder.as_path()), cover, now), *mtime));
+                        // "Added" is when the file appeared: its modification time, which for
+                        // music copied or downloaded in is when it arrived.
+                        let added = if *mtime > 0 { (*mtime).min(now) } else { now };
+                        out.push((read_track_in(path, Some(folder.as_path()), cover, added), *mtime));
                         let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                         if n % 50 == 0 {
                             progress(n, total);
@@ -157,6 +163,8 @@ pub fn read_track(path: &Path, cover: Option<String>, added_at: i64) -> Track {
 pub fn read_track_in(path: &Path, root: Option<&Path>, cover: Option<String>, added_at: i64) -> Track {
     let path_str = path.to_string_lossy().to_string();
     let mut track = Track {
+        album_artist: String::new(),
+        disc_no: None,
         id: Track::local_id(&path_str),
         source: Source::Local,
         title: String::new(),
@@ -180,6 +188,12 @@ pub fn read_track_in(path: &Path, root: Option<&Path>, cover: Option<String>, ad
                 let names = tag_names(tag);
                 (track.title, track.artist, track.album) = (names.title, names.artist, names.album);
                 track.track_no = names.track_no;
+                // Albums group by their artist: a compilation's songs stay one album.
+                let album_artist = tag.get_string(ItemKey::AlbumArtist).map(str::trim).unwrap_or_default();
+                if !album_artist.eq_ignore_ascii_case(&track.artist) {
+                    track.album_artist = album_artist.to_string();
+                }
+                track.disc_no = tag.disk().filter(|n| *n > 0);
             }
         }
         Err(e) => tracing::debug!("could not read tags of {}: {e}", path.display()),

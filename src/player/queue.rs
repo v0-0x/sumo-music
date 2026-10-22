@@ -312,11 +312,40 @@ impl Queue {
         }
     }
 
+    /// Drops the rest of the playlist (songs you queued stay).
     pub fn clear_upcoming(&mut self) {
-        self.up_next.clear();
         let keep = self.pos.map_or(0, |p| p + 1);
         if keep < self.order.len() {
             self.removed.extend(self.order.drain(keep..));
+        }
+    }
+
+    /// Drops the songs you queued.
+    pub fn clear_queued(&mut self) {
+        self.up_next.clear();
+    }
+
+    /// Moves song `id` from entry `from` of `upcoming()` to entry `to` (where it ends up).
+    /// Songs move within their part: the ones you queued among themselves, the rest of the
+    /// playlist among itself.
+    pub fn move_upcoming(&mut self, from: usize, to: usize, id: &str) {
+        let Some(from) = self.find_upcoming(from, id) else {
+            return;
+        };
+        let queued = self.up_next.len();
+        if from < queued {
+            let to = to.min(queued - 1);
+            if let Some(t) = self.up_next.remove(from) {
+                self.up_next.insert(to, t);
+            }
+            return;
+        }
+        let rest = self.pos.map_or(0, |p| p + 1);
+        let (a, b) = (rest + from - queued, rest + to.max(queued) - queued);
+        if a < self.order.len() {
+            let b = b.min(self.order.len() - 1);
+            let i = self.order.remove(a);
+            self.order.insert(b, i);
         }
     }
 
@@ -333,6 +362,8 @@ mod tests {
     fn tracks(n: usize) -> Vec<Track> {
         (0..n)
             .map(|i| Track {
+                album_artist: String::new(),
+                disc_no: None,
                 id: format!("t{i}"),
                 source: Source::Local,
                 title: format!("T{i}"),
@@ -437,6 +468,28 @@ mod tests {
         let mut bad = state;
         bad.order.push(99);
         assert!(!Queue::default().restore(bad, find));
+    }
+
+    #[test]
+    fn moving_and_clearing_parts() {
+        let mut q = Queue::default();
+        q.set_context(tracks(6), 0, String::new());
+        let extra = tracks(9);
+        q.enqueue(vec![extra[7].clone(), extra[8].clone()]);
+        let ids = |q: &Queue| q.upcoming(20).into_iter().map(|t| t.id).collect::<Vec<_>>();
+        // Upcoming: t7 t8 (queued) | t1 t2 t3 t4 t5.
+        q.move_upcoming(1, 0, "t8");
+        assert_eq!(ids(&q), ["t8", "t7", "t1", "t2", "t3", "t4", "t5"]);
+        q.move_upcoming(2, 5, "t1");
+        assert_eq!(ids(&q), ["t8", "t7", "t2", "t3", "t4", "t1", "t5"]);
+        // A queued song stays among the queued ones.
+        q.move_upcoming(0, 6, "t8");
+        assert_eq!(ids(&q), ["t7", "t8", "t2", "t3", "t4", "t1", "t5"]);
+        q.clear_queued();
+        assert_eq!(ids(&q), ["t2", "t3", "t4", "t1", "t5"]);
+        q.enqueue(vec![extra[7].clone()]);
+        q.clear_upcoming();
+        assert_eq!(ids(&q), ["t7"]);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use egui::{Color32, RichText, Ui};
 use egui_phosphor::regular as icon;
 
+use super::picker::{self, Pick};
 use super::theme::{self, *};
 use super::widgets;
 use super::{Action, Cx};
@@ -99,7 +100,7 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut st.new_folder)
                             .hint_text("~/Music  (or drop a folder onto the window)")
-                            .desired_width(ui.available_width() - 90.0),
+                            .desired_width(ui.available_width() - 160.0),
                     );
                     let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if (ui.button("Add").clicked() || enter) && !st.new_folder.trim().is_empty() {
@@ -108,6 +109,14 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                             cfg.library.folders.push(p);
                         }
                         st.new_folder.clear();
+                    }
+                    if ui.button(theme::ic(icon::FOLDER_OPEN, "Browse…")).clicked() {
+                        picker::open(ui.ctx(), "library-folder", "Add a music folder", Pick::Folder);
+                    }
+                    match picker::take(ui.ctx(), "library-folder") {
+                        Some(Ok(p)) if !cfg.library.folders.contains(&p) => cfg.library.folders.push(p),
+                        Some(Err(e)) => cx.actions.push(Action::Cmd(Command::Notify(e))),
+                        _ => {}
                     }
                 });
                 ui.horizontal(|ui| {
@@ -289,7 +298,23 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
             // ---------------------------------------------------------- downloads
             section(ui, icon::DOWNLOAD_SIMPLE, TEXT, "Downloads", |ui| {
                 let root = cfg.library_root().to_string_lossy().into_owned();
-                text_field(ui, "Download folder", &mut cfg.downloads.folder, &format!("{root}/<service>"), false);
+                ui.label(RichText::new("Download folder").color(TEXT_DIM));
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut cfg.downloads.folder)
+                            .hint_text(format!("{root}/<service>"))
+                            .desired_width(ui.available_width() - 100.0),
+                    );
+                    if ui.button(theme::ic(icon::FOLDER_OPEN, "Browse…")).clicked() {
+                        picker::open(ui.ctx(), "download-folder", "Download folder", Pick::Folder);
+                    }
+                    match picker::take(ui.ctx(), "download-folder") {
+                        Some(Ok(p)) => cfg.downloads.folder = p.to_string_lossy().into_owned(),
+                        Some(Err(e)) => cx.actions.push(Action::Cmd(Command::Notify(e))),
+                        None => {}
+                    }
+                });
+                ui.add_space(4.0);
                 hint(
                     ui,
                     "Empty: a SoundCloud, Spotify or Apple Music folder inside your first library folder, so \
@@ -525,16 +550,20 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
             // ---------------------------------------------------------- appearance
             section(ui, icon::SPARKLE, cx.accent, "Appearance", |ui| {
                 ui.checkbox(&mut cfg.ui.dynamic_accent, "Colour backgrounds with the current cover");
+                if cfg!(not(any(windows, target_os = "macos"))) {
+                    ui.checkbox(&mut cfg.ui.notifications, "Show a notification when a song starts");
+                }
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Accent colour").color(TEXT_DIM));
                     ui.color_edit_button_srgb(&mut cfg.ui.accent);
                 });
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Interface scale").color(TEXT_DIM));
-                    let r = ui.add(egui::Slider::new(&mut cfg.ui.scale, 0.75..=1.75).step_by(0.05));
+                    let r = ui.add(egui::Slider::new(&mut cfg.ui.scale, super::SCALE.0..=super::SCALE.1).step_by(0.05));
                     if r.drag_stopped() || r.lost_focus() {
                         ui.ctx().set_zoom_factor(cfg.ui.scale);
                     }
+                    ui.label(RichText::new("Ctrl + / Ctrl − / Ctrl 0").color(TEXT_FAINT).small());
                 });
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Covers kept in memory").color(TEXT_DIM));
@@ -666,8 +695,21 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                     ui.add(
                         egui::TextEdit::singleline(&mut st.settings_file)
                             .hint_text("Settings file to import (or drop it onto the window)")
-                            .desired_width(ui.available_width() - 90.0),
+                            .desired_width(ui.available_width() - 190.0),
                     );
+                    if ui.button(theme::ic(icon::FOLDER_OPEN, "Browse…")).clicked() {
+                        picker::open(
+                            ui.ctx(),
+                            "settings-file",
+                            "Settings file to import",
+                            Pick::File("Sumo settings", &["json"]),
+                        );
+                    }
+                    match picker::take(ui.ctx(), "settings-file") {
+                        Some(Ok(p)) => st.settings_file = p.to_string_lossy().into_owned(),
+                        Some(Err(e)) => cx.actions.push(Action::Cmd(Command::Notify(e))),
+                        None => {}
+                    }
                     let file = expand_home(&st.settings_file);
                     if ui
                         .add_enabled(file.is_file(), egui::Button::new(theme::ic(icon::DOWNLOAD_SIMPLE, "Import…")))

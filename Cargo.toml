@@ -1,6 +1,6 @@
 [package]
 name = "multimusic"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 description = "A fast, lightweight, native music player for local files, Spotify and SoundCloud"
 license = "MIT"
@@ -42,6 +42,14 @@ sha2 = "0.10"
 base64 = "0.22"
 futures-util = "0.3"
 raw-window-handle = "0.6"
+
+# The system's file and folder pickers; on Linux Sumo asks the desktop portal itself.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+rfd = { version = "0.15", default-features = false }
+pollster = "0.4"
+
+[target.'cfg(not(any(windows, target_os = "macos")))'.dependencies]
+zbus = "3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

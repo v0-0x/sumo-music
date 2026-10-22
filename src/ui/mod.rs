@@ -2,6 +2,7 @@
 
 mod art;
 mod panels;
+mod picker;
 mod profile;
 mod settings;
 mod tag_editor;
@@ -12,7 +13,7 @@ mod widgets;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use egui::{Color32, Key, Modifiers};
+use egui::{Color32, Key, Modifiers, Rect};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::{Config, Paths};
@@ -121,7 +122,34 @@ enum Dialog {
     },
 }
 
+/// What the `?` overlay lists.
+const SHORTCUTS: &[(&str, &str)] = &[
+    ("Space", "Play / pause"),
+    ("← / →", "Back / forward 5 seconds"),
+    ("Ctrl ← / Ctrl →", "Previous / next song"),
+    ("↑ / ↓", "Volume up / down"),
+    ("M", "Mute"),
+    ("S", "Shuffle on / off"),
+    ("R", "Repeat: all, one, off"),
+    ("H", "Like the playing song"),
+    ("L", "Full screen lyrics"),
+    ("/ or Ctrl F", "Search"),
+    ("Alt ← / Alt →", "Back / forward a page"),
+    ("Ctrl A / C / X / V", "Pick all, copy, cut, paste songs"),
+    ("Delete", "Remove picked songs from your playlist"),
+    ("Ctrl + / − / 0", "Bigger / smaller / normal interface"),
+    ("Ctrl Q", "Quit"),
+    ("?", "This list"),
+];
+
+/// The interface scale's range (Settings, and Ctrl +/−).
+pub const SCALE: (f32, f32) = (0.6, 2.5);
+
 pub struct App {
+    /// The zoom last seen, to notice Ctrl +/− changing it.
+    zoom: f32,
+    /// The `?` shortcut list is open.
+    show_keys: bool,
     shared: Arc<Shared>,
     cmd: UnboundedSender<Command>,
     pub(crate) cfg: Config,
@@ -134,6 +162,10 @@ pub struct App {
     history: Vec<View>,
     forward: Vec<View>,
     right_tab: RightTab,
+    /// The right panel floating over the page (when the window is too narrow for it beside).
+    right_overlay: bool,
+    /// Whether the right panel fits beside the page this frame.
+    right_fits: bool,
     accent: Color32,
     styled_accent: Color32,
     tint: Color32,
@@ -183,7 +215,8 @@ impl App {
         let accent = Color32::from_rgb(cfg.ui.accent[0], cfg.ui.accent[1], cfg.ui.accent[2]);
         theme::setup_fonts(&ctx, false);
         theme::apply_style(&ctx, accent);
-        ctx.set_zoom_factor(cfg.ui.scale.clamp(0.6, 2.5));
+        let zoom = cfg.ui.scale.clamp(SCALE.0, SCALE.1);
+        ctx.set_zoom_factor(zoom);
         let art = ArtCache::new(rt.clone(), paths.art_cache(), cfg.ui.art_cache_size);
         let logo = theme::load_logo(&ctx);
         // Windows' media overlay and keys are tied to the window.
@@ -209,6 +242,10 @@ impl App {
             history: Vec::new(),
             forward: Vec::new(),
             right_tab: RightTab::NowPlaying,
+            right_overlay: false,
+            right_fits: true,
+            zoom,
+            show_keys: false,
             accent,
             styled_accent: accent,
             tint: NEUTRAL_TINT,
@@ -346,6 +383,11 @@ impl App {
                         tracing::warn!("not opening {url}: only web pages and folders are opened");
                     }
                 }
+                Action::RightTab(t) if !self.right_fits => {
+                    // No room beside the page: it opens over it, just for now.
+                    self.right_overlay = !(self.right_overlay && self.right_tab == t);
+                    self.right_tab = t;
+                }
                 Action::RightTab(t) => {
                     if self.cfg.ui.show_right_panel && self.right_tab == t {
                         self.cfg.ui.show_right_panel = false;
@@ -355,6 +397,7 @@ impl App {
                     }
                     self.cfg_changed_at = Some(Instant::now());
                 }
+                Action::ToggleRightPanel if self.right_overlay => self.right_overlay = false,
                 Action::ToggleRightPanel => {
                     self.cfg.ui.show_right_panel = !self.cfg.ui.show_right_panel;
                     self.cfg_changed_at = Some(Instant::now());
@@ -406,9 +449,33 @@ impl App {
                 i.modifiers.alt,
                 i.pointer.button_pressed(egui::PointerButton::Extra1),
                 i.pointer.button_pressed(egui::PointerButton::Extra2),
-                i.key_pressed(Key::Slash),
+                i.key_pressed(Key::Slash) && !i.modifiers.shift,
             )
         });
+        // Plain letters, without Ctrl or Alt.
+        let (s, r, m, h, help) = ctx.input(|i| {
+            let plain = |k: Key| i.key_pressed(k) && !i.modifiers.command && !i.modifiers.alt;
+            let question =
+                i.key_pressed(Key::Questionmark) || i.events.iter().any(|e| *e == egui::Event::Text("?".into()));
+            (plain(Key::S), plain(Key::R), plain(Key::M), plain(Key::H), question)
+        });
+        if help {
+            self.show_keys = !self.show_keys;
+        }
+        if s {
+            self.send(Command::SetShuffle(!player.shuffle));
+        }
+        if r {
+            self.send(Command::CycleRepeat);
+        }
+        if m {
+            self.send(panels::mute_command(ctx, player.volume));
+        }
+        if h {
+            if let Some(t) = &player.current {
+                self.send(Command::ToggleLike(t.clone()));
+            }
+        }
         if mouse_back || (alt && left) {
             self.back();
         }
@@ -454,6 +521,35 @@ impl App {
         }
         if ctrl && q {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// The `?` overlay: every keyboard shortcut.
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        if !self.show_keys {
+            return;
+        }
+        let modal = egui::Modal::new(egui::Id::new("shortcuts")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.label(egui::RichText::new("Keyboard shortcuts").font(theme::bold_font(18.0)));
+            ui.add_space(10.0);
+            egui::Grid::new("shortcut-grid")
+                .num_columns(2)
+                .spacing([24.0, 8.0])
+                .show(ui, |ui| {
+                    for (keys, what) in SHORTCUTS {
+                        ui.label(egui::RichText::new(*keys).color(theme::TEXT).strong());
+                        ui.label(egui::RichText::new(*what).color(theme::TEXT_DIM));
+                        ui.end_row();
+                    }
+                });
+            ui.add_space(10.0);
+            if widgets::pill(ui, "Close", theme::CARD, theme::TEXT).clicked() {
+                self.show_keys = false;
+            }
+        });
+        if modal.should_close() {
+            self.show_keys = false;
         }
     }
 
@@ -564,6 +660,40 @@ impl App {
         if needed {
             theme::setup_fonts(ctx, true);
             self.cjk_loaded = true;
+        }
+    }
+
+    /// Keeps the zoom (Ctrl +/− or Settings) and the window's size in the settings.
+    fn remember_window(&mut self, ctx: &egui::Context) {
+        let zoom = ctx.zoom_factor();
+        if zoom != self.zoom {
+            let kept = zoom.clamp(SCALE.0, SCALE.1);
+            if kept != zoom {
+                ctx.set_zoom_factor(kept);
+            }
+            self.zoom = kept;
+            self.cfg.ui.scale = (kept * 100.0).round() / 100.0;
+        }
+        let (inner, maximized, fullscreen, minimized) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.inner_rect, v.maximized, v.fullscreen, v.minimized)
+        });
+        if fullscreen == Some(true) || minimized == Some(true) {
+            return;
+        }
+        if let Some(maximized) = maximized {
+            self.cfg.ui.maximized = maximized;
+            if maximized {
+                // The size to go back to is the one from before.
+                return;
+            }
+        }
+        if let Some(r) = inner {
+            // In screen points, as the window is made with: without the zoom.
+            let size = [(r.width() * self.zoom).round(), (r.height() * self.zoom).round()];
+            if size[0] >= 200.0 && size[1] >= 200.0 && self.cfg.ui.window_size != Some(size) {
+                self.cfg.ui.window_size = Some(size);
+            }
         }
     }
 
@@ -941,9 +1071,12 @@ impl eframe::App for App {
                 .ui
                 .right_panel_width
                 .clamp(panels::RIGHT_MIN, panels::RIGHT_MAX);
-            let show_right = self.cfg.ui.show_right_panel
-                && self.view != View::NowPlaying
-                && width - sidebar_w - right_w - 2.0 * panels::GAP >= 420.0;
+            self.right_fits = width - sidebar_w - right_w - 2.0 * panels::GAP >= 420.0;
+            let show_right = self.cfg.ui.show_right_panel && self.view != View::NowPlaying && self.right_fits;
+            if self.right_fits || self.view == View::NowPlaying {
+                self.right_overlay = false;
+            }
+            let overlay = self.right_overlay;
             let right_tab = self.right_tab;
 
             let mut cx = Cx {
@@ -957,7 +1090,7 @@ impl eframe::App for App {
                 logo: self.logo.id(),
             };
 
-            panels::player_dock(ui, &mut cx, show_right.then_some(right_tab));
+            panels::player_dock(ui, &mut cx, (show_right || overlay).then_some(right_tab));
             let mut side = panels::SidebarState {
                 view: &self.view,
                 search_text: &mut self.search_text,
@@ -983,6 +1116,7 @@ impl eframe::App for App {
                 resized = Some(((!narrow).then_some(sidebar_used), right_used));
             }
             let (can_back, can_forward) = (!self.history.is_empty(), !self.forward.is_empty());
+            let page_area = ui.available_rect_before_wrap();
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::new()
@@ -1043,6 +1177,23 @@ impl eframe::App for App {
                         views::show(ui, &mut cx, &mut state);
                     }
                 });
+            if overlay {
+                let area = Rect::from_min_max(
+                    egui::pos2(page_area.left() + panels::GAP, page_area.top() + panels::GAP),
+                    egui::pos2(page_area.right() - panels::GAP, page_area.bottom()),
+                );
+                panels::right_overlay(&ctx, &mut cx, right_tab, area);
+                // A click on the page (or Escape) puts it away.
+                let width = panels::RIGHT_MIN.max(area.width().min(360.0));
+                let on_page = Rect::from_min_max(area.min, egui::pos2(area.right() - width, area.bottom()));
+                let away = ctx.input(|i| {
+                    i.key_pressed(Key::Escape)
+                        || (i.pointer.any_click() && i.pointer.interact_pos().is_some_and(|p| on_page.contains(p)))
+                });
+                if away {
+                    self.right_overlay = false;
+                }
+            }
         }
         self.toasts(&ctx, &feed_guard);
         if let Some((sidebar, right)) = resized {
@@ -1099,8 +1250,10 @@ impl eframe::App for App {
 
         self.apply(&ctx, actions);
         self.dialogs(&ctx);
+        self.shortcuts(&ctx);
         self.service_stopped(&ctx);
         self.tag_editor(&ctx);
+        self.remember_window(&ctx);
         self.sync_config(&ctx);
         self.check_memory(&ctx);
 

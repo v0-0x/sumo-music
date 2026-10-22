@@ -324,6 +324,8 @@ mod tests {
 
     fn track(id: &str, source: Source, uri: &str) -> Track {
         Track {
+            album_artist: String::new(),
+            disc_no: None,
             id: id.into(),
             source,
             title: id.into(),

@@ -52,6 +52,26 @@ CREATE TABLE IF NOT EXISTS kv (
 );
 ";
 
+/// Brings a database made by an older version up to date. `user_version` counts the steps
+/// done; each runs once.
+fn migrate(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let steps: &[&str] = &[
+        // 1 (0.6.0): album artist and disc number of local files; plays looked up by song.
+        "ALTER TABLE tracks ADD COLUMN album_artist TEXT NOT NULL DEFAULT '';
+         ALTER TABLE tracks ADD COLUMN disc_no INTEGER;
+         CREATE INDEX IF NOT EXISTS plays_track ON plays(track_id);",
+    ];
+    for (i, step) in steps.iter().enumerate().skip(version.max(0) as usize) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(step)
+            .with_context(|| format!("updating the database (step {})", i + 1))?;
+        tx.pragma_update(None, "user_version", (i + 1) as i64)?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -69,16 +89,20 @@ impl Db {
         // Keep SQLite's page cache small; the library is held in memory anyway.
         conn.pragma_update(None, "cache_size", -512)?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Db { conn })
     }
 
     pub fn load_tracks(&self) -> Result<Vec<Track>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, source, title, artist, album, duration_ms, track_no, art, uri, added_at FROM tracks",
+            "SELECT id, source, title, artist, album, duration_ms, track_no, art, uri, added_at, album_artist, disc_no
+             FROM tracks",
         )?;
         let rows = stmt.query_map([], |r| {
             let source: String = r.get(1)?;
             Ok(Track {
+                album_artist: r.get(10)?,
+                disc_no: r.get::<_, Option<i64>>(11)?.map(|n| n as u32),
                 id: r.get(0)?,
                 source: Source::parse(&source).unwrap_or(Source::Local),
                 title: r.get(2)?,
@@ -99,12 +123,14 @@ impl Db {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO tracks (id, source, title, artist, album, duration_ms, track_no, art, uri, added_at, mtime)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "INSERT INTO tracks (id, source, title, artist, album, duration_ms, track_no, art, uri, added_at, mtime,
+                    album_artist, disc_no)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(id) DO UPDATE SET
                     source = excluded.source, title = excluded.title, artist = excluded.artist,
                     album = excluded.album, duration_ms = excluded.duration_ms, track_no = excluded.track_no,
                     art = excluded.art, uri = excluded.uri,
+                    album_artist = excluded.album_artist, disc_no = excluded.disc_no,
                     added_at = CASE WHEN tracks.added_at = 0 THEN excluded.added_at ELSE tracks.added_at END,
                     mtime = excluded.mtime",
             )?;
@@ -121,6 +147,8 @@ impl Db {
                     t.uri,
                     t.added_at,
                     mtimes.get(&t.id).copied().unwrap_or(0),
+                    t.album_artist,
+                    t.disc_no.map(|n| n as i64),
                 ])?;
             }
         }
@@ -253,12 +281,12 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Track ids ordered by play count, most played first.
-    #[cfg(test)]
+    /// Ids of songs played at least twice, most played (then most recently played) first.
     pub fn top_plays(&self, limit: usize) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT track_id, COUNT(*) AS c FROM plays GROUP BY track_id ORDER BY c DESC LIMIT ?1")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT track_id, COUNT(*) AS c, MAX(played_at) AS last FROM plays GROUP BY track_id
+             HAVING c >= 2 ORDER BY c DESC, last DESC LIMIT ?1",
+        )?;
         let rows = stmt.query_map([limit as i64], |r| r.get::<_, String>(0))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
@@ -313,6 +341,8 @@ mod tests {
 
     fn track(id: &str, source: Source) -> Track {
         Track {
+            album_artist: String::new(),
+            disc_no: None,
             id: id.into(),
             source,
             title: format!("Title {id}"),
@@ -324,6 +354,41 @@ mod tests {
             uri: id.into(),
             added_at: 5,
         }
+    }
+
+    /// An older database gets the new columns once; album artist and disc come back.
+    #[test]
+    fn old_databases_are_updated() {
+        let dir = std::env::temp_dir().join(format!("multimusic-db-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.db");
+        {
+            // As 0.5 made it: no migrations run yet.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.execute(
+                "INSERT INTO tracks (id, source, title, artist, album, duration_ms, uri) VALUES ('local:/a', 'local', 'A', 'B', 'C', 1, '/a')",
+                [],
+            )
+            .unwrap();
+        }
+        let mut db = Db::open(&path).unwrap();
+        let old = db.load_tracks().unwrap();
+        assert_eq!((old.len(), old[0].album_artist.as_str(), old[0].disc_no), (1, "", None));
+        let mut t = track("local:/b", Source::Local);
+        t.album_artist = "Various Artists".into();
+        t.disc_no = Some(2);
+        db.upsert_tracks(std::slice::from_ref(&t), &HashMap::new()).unwrap();
+        drop(db);
+        // Opening again doesn't run the steps twice.
+        let db = Db::open(&path).unwrap();
+        let back = db.load_tracks().unwrap().into_iter().find(|x| x.id == t.id).unwrap();
+        assert_eq!(back, t);
+        let version: i64 = db.conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(version, 1);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -379,7 +444,8 @@ mod tests {
         db.record_play("b", 2).unwrap();
         db.record_play("a", 3).unwrap();
         assert_eq!(db.recent_plays(10).unwrap(), vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(db.top_plays(1).unwrap(), vec!["a".to_string()]);
+        // Played once isn't "most played" yet.
+        assert_eq!(db.top_plays(10).unwrap(), vec!["a".to_string()]);
         db.set_kv("k", "v").unwrap();
         assert_eq!(db.get_kv("k").as_deref(), Some("v"));
         db.set_kv("download:soundcloud:1", "/a.mp3").unwrap();
